@@ -117,25 +117,9 @@ void mySplitCommandLine(int numArguments, char *arguments[],UStringVector &parts
   // set the program's current locale from the user's environment variables
   setlocale(LC_ALL,"");
 
-  // auto-detect which conversion p7zip should use
-  char *locale = setlocale(LC_CTYPE,0);
-  if (locale) {
-    size_t len = strlen(locale);
-    char *locale_upper = (char *)malloc(len+1);
-    if (locale_upper) {
-      strcpy(locale_upper,locale);
-
-      for(size_t i=0;i<len;i++)
-        locale_upper[i] = toupper(locale_upper[i] & 255);
-
-      if (    (strcmp(locale_upper,"") != 0)
-              && (strcmp(locale_upper,"C") != 0)
-              && (strcmp(locale_upper,"POSIX") != 0) ) {
-        global_use_utf16_conversion = 1;
-      }
-      free(locale_upper);
-    }
-  }
+  // On HarmonyOS, force ASCII-only conversion to avoid mbstowcs issues
+  // that can cause command line parsing failures (exit code 7)
+  global_use_utf16_conversion = 0;
 #elif defined(LOCALE_IS_UTF8)
   global_use_utf16_conversion = 1; // assume LC_CTYPE="utf8"
 #else

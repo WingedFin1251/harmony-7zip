@@ -1,4 +1,4 @@
-import abilityAccessCtrl, { Permissions, PermissionRequestResult } from '@ohos.abilityAccessCtrl';
+﻿import abilityAccessCtrl, { Permissions, PermissionRequestResult } from '@ohos.abilityAccessCtrl';
 import { common } from '@kit.AbilityKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { picker } from '@kit.CoreFileKit';
@@ -556,7 +556,7 @@ struct FileBrowser {
         Button('删除')
           .onClick((): void => {
             try {
-              this.showDeleteConfirmDialog();
+              this.deleteSelected();
             } catch (err) {
               console.error('删除失败', JSON.stringify(err));
               showToast('删除失败');
@@ -925,61 +925,6 @@ struct ExtractDialog {
     .padding(16)
     .width('90%')
     .height(this.showDirPicker ? '80%' : 'auto')
-    .backgroundColor('#fff')
-    .borderRadius(16)
-  }
-}
-
-// 删除确认对话框组件
-@CustomDialog
-struct DeleteConfirmDialog {
-  controller?: CustomDialogController;
-  @Prop message: string = '';
-  onConfirm?: () => Promise<void>;
-
-  build() {
-    Column() {
-      Text('确认删除')
-        .fontSize(20)
-        .fontWeight(FontWeight.Bold)
-        .margin({ top: 16, bottom: 16 })
-
-      Text(this.message)
-        .fontSize(14)
-        .textAlign(TextAlign.Start)
-        .padding({ left: 16, right: 16, bottom: 24 })
-        .width('100%')
-
-      Row() {
-        Button('取消')
-          .onClick((): void => {
-            this.controller?.close();
-          })
-          .backgroundColor('#f0f0f0')
-          .fontColor(Color.Black)
-          .margin(8)
-          .width(100)
-          .height(40)
-
-        Button('确认删除')
-          .onClick(async (): Promise<void> => {
-            this.controller?.close();
-            if (this.onConfirm) {
-              await this.onConfirm();
-            }
-          })
-          .backgroundColor('#ff4d4f')
-          .fontColor(Color.White)
-          .margin(8)
-          .width(100)
-          .height(40)
-      }
-      .justifyContent(FlexAlign.Center)
-      .width('100%')
-      .margin({ bottom: 16 })
-    }
-    .padding(16)
-    .width('80%')
     .backgroundColor('#fff')
     .borderRadius(16)
   }
