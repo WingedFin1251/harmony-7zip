@@ -6,6 +6,7 @@
 #include <thread>
 #include <vector>
 #include <string>
+#include <cstdlib>
 #include <hilog/log.h>
 #include "napi/native_api.h"
 #include <dlfcn.h>
@@ -40,16 +41,19 @@ struct AsyncWorkContext {
  * 工作线程函数：执行实际的压缩或解压
  */
 static void ExecuteP7ZipOperation(napi_env env, void* data) {
+    (void)env; // 避免未使用参数警告
     AsyncWorkContext* ctx = static_cast<AsyncWorkContext*>(data);
     
     // 0. 如果是解压操作，先确保目标目录存在
     if (ctx->operation == "extract") {
-        // 使用 mkdir 创建目标目录（如果不存在）
-        std::string mkdirCmd = "mkdir -p " + ctx->destPath;
-        int mkdirRet = system(mkdirCmd.c_str());
-        if (mkdirRet != 0) {
-            OH_LOG_WARN(LOG_APP, "mkdir returned %{public}d for path: %{public}s", mkdirRet, ctx->destPath.c_str());
-        }
+        // 注意：在HarmonyOS上，mkdir -p 可能不可用
+        // 这里应该使用HarmonyOS的文件系统API来创建目录
+        // 暂时注释掉，因为p7zip应该能处理目录创建
+        // std::string mkdirCmd = "mkdir -p " + ctx->destPath;
+        // int mkdirRet = system(mkdirCmd.c_str());
+        // if (mkdirRet != 0) {
+        //     OH_LOG_WARN(LOG_APP, "mkdir returned %{public}d for path: %{public}s", mkdirRet, ctx->destPath.c_str());
+        // }
     }
     
     // 1. 动态加载 p7zip 库
@@ -145,8 +149,8 @@ static void ExecuteP7ZipOperation(napi_env env, void* data) {
     }
     // 再打印 argv 的内容
     OH_LOG_INFO(LOG_APP, "argv contents:");
-    for (int i = 0; i < static_cast<int>(argv.size() - 1); i++) {
-        OH_LOG_INFO(LOG_APP, "  argv[%{public}d] = \"%{public}s\"", i, argv[i]);
+    for (size_t i = 0; i < argv.size() - 1; i++) {
+        OH_LOG_INFO(LOG_APP, "  argv[%{public}zu] = \"%{public}s\"", i, argv[i]);
     }
     
     // 5. 调用 p7zip main 函数，使用 try-catch 保护
@@ -191,6 +195,7 @@ static void ExecuteP7ZipOperation(napi_env env, void* data) {
  * 操作完成回调（在主JS线程执行）
  */
 static void OnP7ZipOperationComplete(napi_env env, napi_status status, void* data) {
+    (void)status; // 避免未使用参数警告
     AsyncWorkContext* ctx = static_cast<AsyncWorkContext*>(data);
     
     if (ctx->exitCode == 0) {

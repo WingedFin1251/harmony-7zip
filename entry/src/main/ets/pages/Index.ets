@@ -1,5 +1,3 @@
-import abilityAccessCtrl, { Permissions, PermissionRequestResult } from '@ohos.abilityAccessCtrl';
-import { common } from '@kit.AbilityKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { picker } from '@kit.CoreFileKit';
 import { fileIo } from '@kit.CoreFileKit';
@@ -7,6 +5,7 @@ import * as native from 'libentry.so';
 import { showToast } from '../utils/ToastUtil';
 import { FileRow } from '../components/FileRow';
 import { FileGridCell } from '../components/FileGridCell';
+
 
 // 临时定义权限类型（如果从 SDK 导入失败）
 
@@ -366,6 +365,12 @@ struct FileBrowser {
    */
   async importFiles(): Promise<void> {
     try {
+      // 检查picker API是否可用
+      if (!canIUse('SystemCapability.FileManagement.UserFileService')) {
+        showToast('当前设备不支持文件选择功能');
+        return;
+      }
+      
       // 创建文件选择器
       const documentPicker = new picker.DocumentViewPicker();
       const result = await documentPicker.select({
@@ -405,8 +410,6 @@ struct FileBrowser {
     try {
       // 打开源文件（只读）
       const srcFile = fileIo.openSync(uri, fileIo.OpenMode.READ_ONLY);
-      // 获取文件名
-      const stat = fileIo.statSync(srcFile.fd);
       // 从 URI 中提取文件名
       const uriParts = uri.split('/');
       const fileName = uriParts[uriParts.length - 1];
@@ -909,6 +912,7 @@ struct ExtractDialog {
           }
           .layoutWeight(1)
           .width('100%')
+          .height('100%')
 
           // 按钮行
           Row() {
