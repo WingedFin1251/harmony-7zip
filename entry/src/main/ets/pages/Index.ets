@@ -196,8 +196,8 @@ struct FileBrowser {
       builder: ExtractDialog({
         archivePath: first.path,
         sandboxRoot: this.getSandboxRoot(),
-        onConfirm: (destPath: string, password?: string): void => {
-          this.startExtract(first.path, destPath, password);
+        onConfirm: async (destPath: string, password?: string): Promise<void> => {
+          await this.startExtract(first.path, destPath, password);
         }
       }),
       cancel: (): void => { this.extractDialogController?.close(); }
@@ -208,35 +208,76 @@ struct FileBrowser {
   async startExtract(archivePath: string, destPath: string, password?: string): Promise<void> {
     this.isLoading = true;
     try {
+      console.info('开始解压操作:', { archivePath, destPath, password });
+      
+      // 0. 验证路径
+      if (!archivePath || !destPath) {
+        showToast('解压失败: 路径不能为空');
+        return;
+      }
+      
+      // 确保目标路径在沙箱内
+      const sandboxRoot = this.getSandboxRoot();
+      if (!destPath.startsWith(sandboxRoot)) {
+        console.error('目标路径不在沙箱内:', { destPath, sandboxRoot });
+        showToast('解压失败: 目标路径必须在应用沙箱内');
+        return;
+      }
+
       // 1. 检查压缩文件是否存在
       try {
-        fileIo.statSync(archivePath);
+        const stat = fileIo.statSync(archivePath);
+        console.info('压缩文件状态:', { path: archivePath, isFile: stat.isFile(), isDirectory: stat.isDirectory() });
+        
+        if (!stat.isFile()) {
+          showToast('解压失败: 选择的不是文件');
+          return;
+        }
       } catch (statErr) {
-        showToast('解压失败: 压缩文件不存在');
         console.error('压缩文件不存在: ' + archivePath, JSON.stringify(statErr));
+        showToast('解压失败: 压缩文件不存在');
         return;
       }
 
       // 2. 确保目标目录存在（如果不存在则创建）
+      console.info('创建目标目录:', destPath);
       try {
+        // 先检查目标路径是否已经是文件
+        try {
+          const destStat = fileIo.statSync(destPath);
+          if (destStat.isFile()) {
+            showToast('解压失败: 目标路径是文件，不是目录');
+            return;
+          }
+        } catch (e) {
+          // 路径不存在，继续创建
+        }
+        
         fileIo.mkdirSync(destPath, true); // recursive = true
+        console.info('目录创建成功或已存在:', destPath);
       } catch (mkdirErr) {
-        // 如果目录已存在，忽略错误
-        console.info('创建目录（可能已存在）: ' + destPath);
+        console.error('创建目录失败:', destPath, JSON.stringify(mkdirErr));
+        showToast('解压失败: 无法创建目标目录');
+        return;
       }
 
       // 3. 执行解压
+      console.info('调用原生解压接口...');
       await native.extract(archivePath, destPath, password);
+      console.info('解压操作完成');
       showToast('解压成功');
+      
+      // 4. 刷新文件列表
       this.refresh();
     } catch (err) {
       const errMsg = (err as BusinessError).message || JSON.stringify(err);
+      console.error('解压失败详情:', errMsg, err);
       showToast('解压失败: ' + errMsg);
-      console.error('解压失败详情', errMsg);
     } finally {
       this.isLoading = false;
       this.selectedIndices.clear();
       this.isSelectionMode = false;
+      console.info('解压操作结束，清理状态');
     }
   }
 
@@ -679,14 +720,16 @@ struct CompressDialog {
           .onClick((): void => { this.controller?.close(); })
           .margin(8)
         Button('开始压缩')
-          .onClick((): void => {
+          .onClick(async (): Promise<void> => {
             this.controller?.close();
             // 使用可选链调用 onConfirm
-            this.onConfirm?.({
-              format: this.formats[this.selectedIndex],
-              password: this.password || undefined,
-              splitSize: this.splitSize || undefined
-            });
+            if (this.onConfirm) {
+              await this.onConfirm({
+                format: this.formats[this.selectedIndex],
+                password: this.password || undefined,
+                splitSize: this.splitSize || undefined
+              });
+            }
           })
           .margin(8)
       }
@@ -704,7 +747,7 @@ struct ExtractDialog {
   controller?: CustomDialogController;
   @Prop archivePath: string = '';
   @Prop sandboxRoot: string = '';
-  onConfirm?: (destPath: string, password?: string) => void;
+  onConfirm?: (destPath: string, password?: string) => Promise<void>;
 
   @State destPath: string = '';
   @State password: string = '';
@@ -714,9 +757,27 @@ struct ExtractDialog {
 
   aboutToAppear(): void {
     // 根据 archivePath 自动生成默认解压路径
-    const baseName = this.archivePath.substring(this.archivePath.lastIndexOf('/') + 1);
-    const dirName = baseName.replace(/\.[^/.]+$/, '');
-    this.destPath = this.archivePath.substring(0, this.archivePath.lastIndexOf('/') + 1) + dirName;
+    console.info('ExtractDialog.aboutToAppear: archivePath =', this.archivePath);
+    
+    if (!this.archivePath) {
+      console.warn('archivePath 为空，使用沙箱根目录');
+      this.destPath = this.sandboxRoot;
+      return;
+    }
+    
+    const lastSlashIndex = this.archivePath.lastIndexOf('/');
+    if (lastSlashIndex === -1) {
+      console.warn('archivePath 不包含路径分隔符:', this.archivePath);
+      this.destPath = this.sandboxRoot + '/' + this.archivePath.replace(/\.[^/.]+$/, '');
+      return;
+    }
+    
+    const baseName = this.archivePath.substring(lastSlashIndex + 1);
+    const dirName = baseName.replace(/\.[^/.]+$/, '') || 'extracted';
+    const parentDir = this.archivePath.substring(0, lastSlashIndex + 1);
+    
+    this.destPath = parentDir + dirName;
+    console.info('生成的解压路径:', this.destPath);
   }
 
   /**
@@ -913,9 +974,31 @@ struct ExtractDialog {
             })
             .margin(8)
           Button('开始解压')
-            .onClick((): void => {
+            .onClick(async (): Promise<void> => {
+              // 验证目标路径
+              if (!this.destPath || this.destPath.trim() === '') {
+                showToast('请选择或输入有效的目标路径');
+                return;
+              }
+              
+              // 清理路径：移除开头和结尾的空格，确保以沙箱根目录开头
+              let cleanPath = this.destPath.trim();
+              if (!cleanPath.startsWith(this.sandboxRoot)) {
+                // 如果不是绝对路径，则相对于沙箱根目录
+                if (cleanPath.startsWith('/')) {
+                  // 已经是绝对路径，但不在沙箱内
+                  showToast('目标路径必须在应用沙箱内');
+                  return;
+                } else {
+                  // 相对路径，转换为绝对路径
+                  cleanPath = this.sandboxRoot + '/' + cleanPath;
+                }
+              }
+              
               this.controller?.close();
-              this.onConfirm?.(this.destPath, this.password || undefined);
+              if (this.onConfirm) {
+                await this.onConfirm(cleanPath, this.password || undefined);
+              }
             })
             .margin(8)
         }
