@@ -1,11 +1,10 @@
 import { BusinessError } from '@kit.BasicServicesKit';
-import { picker } from '@kit.CoreFileKit';
-import { fileIo } from '@kit.CoreFileKit';
+import { picker, fileIo, fileUri } from '@kit.CoreFileKit';
 import * as native from 'libentry.so';
 import { showToast } from '../utils/ToastUtil';
 import { FileRow } from '../components/FileRow';
 import { FileGridCell } from '../components/FileGridCell';
-import { common, Want } from '@kit.AbilityKit';
+import { common, Want, wantConstant } from '@kit.AbilityKit';
 import { getFileTypeInfo, isArchiveFile, isOpenableFile } from '../utils/FileTypeUtil';
 
 // 临时定义权限类型（如果从 SDK 导入失败）
@@ -247,17 +246,27 @@ struct FileBrowser {
         return;
       }
 
-      // 创建文件URI
-      const fileUri = `file://${item.path}`;
+      // 将文件路径转换为URI
+      let uri: string;
+      try {
+        // 使用fileUri模块获取正确的URI
+        uri = fileUri.getUriFromPath(item.path);
+      } catch (uriErr) {
+        console.error('获取URI失败:', JSON.stringify(uriErr));
+        // 如果获取失败，尝试使用简单路径
+        uri = `file://${item.path}`;
+      }
       
       // 使用系统应用打开文件
       const want: Want = {
-        bundleName: '',
-        abilityName: '',
-        uri: fileUri,
-        type: fileTypeInfo.mimeType,
         action: 'ohos.want.action.viewData',
-        parameters: {}
+        uri: uri,
+        type: fileTypeInfo.mimeType,
+        parameters: {
+          'ability.params.showDefaultPicker': true // 强制显示选择弹窗
+        },
+        // 配置被分享文件的读写权限
+        flags: wantConstant.Flags.FLAG_AUTH_WRITE_URI_PERMISSION | wantConstant.Flags.FLAG_AUTH_READ_URI_PERMISSION
       };
 
       await context.startAbility(want);
