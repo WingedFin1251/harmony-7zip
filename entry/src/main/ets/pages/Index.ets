@@ -5,7 +5,8 @@ import * as native from 'libentry.so';
 import { showToast } from '../utils/ToastUtil';
 import { FileRow } from '../components/FileRow';
 import { FileGridCell } from '../components/FileGridCell';
-
+import { common, Want } from '@kit.AbilityKit';
+import { getFileTypeInfo, isArchiveFile, isOpenableFile } from '../utils/FileTypeUtil';
 
 // 临时定义权限类型（如果从 SDK 导入失败）
 
@@ -25,6 +26,76 @@ interface CompressOptions {
   password?: string;
   splitSize?: string;
 }
+
+// 颜色资源类型
+interface ColorResourceType {
+  background_primary: Resource;
+  background_secondary: Resource;
+  background_tertiary: Resource;
+  background_selected: Resource;
+  text_primary: Resource;
+  text_secondary: Resource;
+  text_tertiary: Resource;
+  text_disabled: Resource;
+  text_inverse: Resource;
+  border_primary: Resource;
+  border_secondary: Resource;
+  accent_primary: Resource;
+  accent_secondary: Resource;
+  accent_tertiary: Resource;
+  status_success: Resource;
+  status_warning: Resource;
+  status_error: Resource;
+  status_info: Resource;
+  icon_primary: Resource;
+  icon_secondary: Resource;
+  icon_disabled: Resource;
+  button_primary_background: Resource;
+  button_primary_text: Resource;
+  button_secondary_background: Resource;
+  button_secondary_text: Resource;
+  button_danger_background: Resource;
+  button_danger_text: Resource;
+  card_background: Resource;
+  dialog_background: Resource;
+  list_item_background: Resource;
+  list_item_selected: Resource;
+}
+
+// 颜色资源常量
+const ColorResource: ColorResourceType = {
+  background_primary: $r('app.color.background_primary'),
+  background_secondary: $r('app.color.background_secondary'),
+  background_tertiary: $r('app.color.background_tertiary'),
+  background_selected: $r('app.color.background_selected'),
+  text_primary: $r('app.color.text_primary'),
+  text_secondary: $r('app.color.text_secondary'),
+  text_tertiary: $r('app.color.text_tertiary'),
+  text_disabled: $r('app.color.text_disabled'),
+  text_inverse: $r('app.color.text_inverse'),
+  border_primary: $r('app.color.border_primary'),
+  border_secondary: $r('app.color.border_secondary'),
+  accent_primary: $r('app.color.accent_primary'),
+  accent_secondary: $r('app.color.accent_secondary'),
+  accent_tertiary: $r('app.color.accent_tertiary'),
+  status_success: $r('app.color.status_success'),
+  status_warning: $r('app.color.status_warning'),
+  status_error: $r('app.color.status_error'),
+  status_info: $r('app.color.status_info'),
+  icon_primary: $r('app.color.icon_primary'),
+  icon_secondary: $r('app.color.icon_secondary'),
+  icon_disabled: $r('app.color.icon_disabled'),
+  button_primary_background: $r('app.color.button_primary_background'),
+  button_primary_text: $r('app.color.button_primary_text'),
+  button_secondary_background: $r('app.color.button_secondary_background'),
+  button_secondary_text: $r('app.color.button_secondary_text'),
+  button_danger_background: $r('app.color.button_danger_background'),
+  button_danger_text: $r('app.color.button_danger_text'),
+  card_background: $r('app.color.card_background'),
+  dialog_background: $r('app.color.dialog_background'),
+  list_item_background: $r('app.color.list_item_background'),
+  list_item_selected: $r('app.color.list_item_selected')
+};
 
 @Entry
 @Component
@@ -55,6 +126,13 @@ struct FileBrowser {
   async loadFiles(): Promise<void> {
     this.isLoading = true;
     try {
+      // 检查fileIo API是否可用
+      if (!canIUse('SystemCapability.FileManagement.File.FileIO')) {
+        showToast('当前设备不支持文件管理功能');
+        this.isLoading = false;
+        return;
+      }
+      
       // 使用 fileIo 读取沙箱目录下的真实文件列表
       const fileNames: string[] = fileIo.listFileSync(this.currentPath);
       const fileItems: FileItem[] = [];
@@ -132,6 +210,62 @@ struct FileBrowser {
       this.selectedIndices.clear();
       this.isSelectionMode = false;
       this.refresh();
+    } else {
+      // 如果是文件，尝试打开它
+      this.openFile(item);
+    }
+  }
+
+  async openFile(item: FileItem): Promise<void> {
+    try {
+      // 检查是否是压缩包
+      if (isArchiveFile(item.name)) {
+        // 对于压缩包，进入选择模式
+        this.isSelectionMode = true;
+        this.selectedIndices.clear();
+        const index = this.files.findIndex(file => file.path === item.path);
+        if (index !== -1) {
+          this.selectedIndices.add(index);
+        }
+        showToast('已选择压缩包，请长按进行解压操作');
+        return;
+      }
+
+      // 检查是否是可打开的文件类型
+      if (!isOpenableFile(item.name)) {
+        showToast('不支持打开此文件类型');
+        return;
+      }
+
+      // 获取文件类型信息
+      const fileTypeInfo = getFileTypeInfo(item.name, false);
+      
+      // 使用系统应用打开文件
+      const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      if (!context) {
+        showToast('无法获取应用上下文');
+        return;
+      }
+
+      // 创建文件URI
+      const fileUri = `file://${item.path}`;
+      
+      // 使用系统应用打开文件
+      const want: Want = {
+        bundleName: '',
+        abilityName: '',
+        uri: fileUri,
+        type: fileTypeInfo.mimeType,
+        action: 'ohos.want.action.viewData',
+        parameters: {}
+      };
+
+      await context.startAbility(want);
+      showToast('正在打开文件...');
+      
+    } catch (err) {
+      console.error('打开文件失败:', JSON.stringify(err));
+      showToast('打开文件失败: ' + (err as BusinessError).message);
     }
   }
 
@@ -208,6 +342,13 @@ struct FileBrowser {
     this.isLoading = true;
     try {
       console.info('开始解压操作:', { archivePath, destPath, password });
+      
+      // 检查fileIo API是否可用
+      if (!canIUse('SystemCapability.FileManagement.File.FileIO')) {
+        showToast('当前设备不支持文件管理功能');
+        this.isLoading = false;
+        return;
+      }
       
       // 0. 验证路径
       if (!archivePath || !destPath) {
@@ -322,6 +463,12 @@ struct FileBrowser {
       return;
     }
 
+    // 检查fileIo API是否可用
+    if (!canIUse('SystemCapability.FileManagement.File.FileIO')) {
+      showToast('当前设备不支持文件管理功能');
+      return;
+    }
+
     let successCount = 0;
     let failCount = 0;
     
@@ -365,22 +512,39 @@ struct FileBrowser {
    */
   async importFiles(): Promise<void> {
     try {
-      // 检查picker API是否可用
+      // 1. 检查系统能力（保持原样）
       if (!canIUse('SystemCapability.FileManagement.UserFileService')) {
         showToast('当前设备不支持文件选择功能');
         return;
       }
-      
-      // 创建文件选择器
-      const documentPicker = new picker.DocumentViewPicker();
-      const result = await documentPicker.select({
-        maxSelectNumber: 10 // 最多选择10个文件
-      });
+
+      // 2. 获取UIAbilityContext（保持原样）
+      let context: common.UIAbilityContext;
+      try {
+        context = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      } catch (e) {
+        console.error('获取UIAbilityContext失败', e);
+        showToast('无法获取应用上下文');
+        return;
+      }
+
+      // 3. 创建文件选择器
+      const documentPicker = new picker.DocumentViewPicker(context);
+
+      // 4. 配置选择选项
+      const documentSelectOptions = new picker.DocumentSelectOptions();
+      documentSelectOptions.maxSelectNumber = 10;
+
+      // 5. 【关键修改】使用Promise形式的select，并直接传入options对象
+      const result: string[] = await documentPicker.select(documentSelectOptions);
+
+      // ... 剩余处理逻辑保持不变 ...
       if (!result || result.length === 0) {
         return;
       }
+
       showToast('正在导入 ' + result.length + ' 个文件...');
-      // 逐个复制文件到当前目录
+
       let successCount = 0;
       for (const uri of result) {
         try {
@@ -390,8 +554,10 @@ struct FileBrowser {
           console.error('导入文件失败: ' + uri, JSON.stringify(err));
         }
       }
+
       showToast('成功导入 ' + successCount + ' 个文件');
       this.refresh();
+
     } catch (err) {
       const bizErr = err as BusinessError;
       if (bizErr.code === 0) {
@@ -403,11 +569,18 @@ struct FileBrowser {
     }
   }
 
+
+
   /**
    * 将 URI 指向的文件复制到当前目录
    */
   async copyFileToCurrentDir(uri: string): Promise<void> {
     try {
+      // 检查fileIo API是否可用
+      if (!canIUse('SystemCapability.FileManagement.File.FileIO')) {
+        throw new Error('当前设备不支持文件操作功能');
+      }
+      
       // 打开源文件（只读）
       const srcFile = fileIo.openSync(uri, fileIo.OpenMode.READ_ONLY);
       // 从 URI 中提取文件名
@@ -453,32 +626,32 @@ struct FileBrowser {
         showToast('当前设备不支持文件保存功能');
         return;
       }
-      
+
       // 创建文件保存对话框
       const documentPicker = new picker.DocumentViewPicker();
-      
+
       // 逐个处理选中的文件
       let successCount = 0;
       for (const sourcePath of selectedPaths) {
         try {
           // 获取文件名
           const fileName = sourcePath.split('/').pop() || 'file';
-          
+
           // 创建保存选项
           const documentSaveOptions = new picker.DocumentSaveOptions();
           documentSaveOptions.newFileNames = [fileName];
-          
+
           // 打开保存对话框，让用户选择保存位置
           const result = await documentPicker.save(documentSaveOptions);
-          
+
           if (!result || result.length === 0) {
             // 用户取消保存当前文件，继续处理下一个
             continue;
           }
-          
+
           // 获取保存的URI
           const destUri = result[0];
-          
+
           // 复制文件到用户选择的位置
           await this.copyFileToPublicDir(sourcePath, destUri);
           successCount++;
@@ -486,13 +659,13 @@ struct FileBrowser {
           console.error('导出文件失败: ' + sourcePath, JSON.stringify(err));
         }
       }
-      
+
       if (successCount > 0) {
         showToast('成功导出 ' + successCount + ' 个文件');
       } else {
         showToast('未导出任何文件');
       }
-      
+
       // 刷新文件列表
       this.refresh();
     } catch (err) {
@@ -511,12 +684,17 @@ struct FileBrowser {
    */
   async copyFileToPublicDir(sourcePath: string, destUri: string): Promise<void> {
     try {
+      // 检查fileIo API是否可用
+      if (!canIUse('SystemCapability.FileManagement.File.FileIO')) {
+        throw new Error('当前设备不支持文件操作功能');
+      }
+      
       // 打开源文件（只读）
       const srcFile = fileIo.openSync(sourcePath, fileIo.OpenMode.READ_ONLY);
-      
+
       // 打开目标文件（读写，若存在则覆盖）
       const destFile = fileIo.openSync(destUri, fileIo.OpenMode.CREATE | fileIo.OpenMode.WRITE_ONLY);
-      
+
       // 复制文件内容
       const bufSize = 1024 * 1024; // 1MB 缓冲区
       const buf = new ArrayBuffer(bufSize);
@@ -526,7 +704,7 @@ struct FileBrowser {
         fileIo.writeSync(destFile.fd, writeBuf);
         bytesRead = fileIo.readSync(srcFile.fd, buf);
       }
-      
+
       // 关闭文件
       fileIo.closeSync(srcFile.fd);
       fileIo.closeSync(destFile.fd);
@@ -570,7 +748,7 @@ struct FileBrowser {
             .margin(20)
           Text('此文件夹为空')
             .fontSize(16)
-            .fontColor('#666')
+            .fontColor(ColorResource.text_secondary)
         }
         .width('100%')
         .layoutWeight(1)
@@ -586,14 +764,7 @@ struct FileBrowser {
                   isSelectionMode: this.isSelectionMode,
                   onSelect: (selected: boolean): void => this.toggleSelect(index, selected),
                   onOpen: (): void => {
-                    if (item.isDir) {
-                      this.openFolder(item);
-                    } else {
-                      if (!this.isSelectionMode) {
-                        this.isSelectionMode = true;
-                        this.selectedIndices.add(index);
-                      }
-                    }
+                    this.openFolder(item);
                   }
                 })
               }
@@ -612,14 +783,7 @@ struct FileBrowser {
                   isSelectionMode: this.isSelectionMode,
                   onSelect: (selected: boolean): void => this.toggleSelect(index, selected),
                   onOpen: (): void => {
-                    if (item.isDir) {
-                      this.openFolder(item);
-                    } else {
-                      if (!this.isSelectionMode) {
-                        this.isSelectionMode = true;
-                        this.selectedIndices.add(index);
-                      }
-                    }
+                    this.openFolder(item);
                   }
                 })
               }
@@ -638,7 +802,7 @@ struct FileBrowser {
     }
     .width('100%')
     .height('100%')
-    .backgroundColor('#fff')
+    .backgroundColor(ColorResource.dialog_background)
   }
 
   // ---------- 标题栏 Builder ----------
@@ -681,7 +845,7 @@ struct FileBrowser {
     .padding({ left: 12, right: 12 })
     .width('100%')
     .height(56)
-    .backgroundColor('#f5f5f5')
+    .backgroundColor(ColorResource.background_secondary)
   }
 
   // ---------- 操作栏 Builder ----------
@@ -769,7 +933,7 @@ struct FileBrowser {
     .padding({ left: 12, right: 12 })
     .width('100%')
     .height(48)
-    .backgroundColor('#fafafa')
+    .backgroundColor(ColorResource.background_tertiary)
   }
 
   // ---------- 底部状态栏 Builder ----------
@@ -778,16 +942,16 @@ struct FileBrowser {
     Row() {
       Text(`选中 ${this.selectedIndices.size} 项`)
         .fontSize(12)
-        .fontColor('#666')
+        .fontColor(ColorResource.text_secondary)
       Blank()
       Text(`${this.files.length} 个项目`)
         .fontSize(12)
-        .fontColor('#666')
+        .fontColor(ColorResource.text_secondary)
     }
     .padding({ left: 12, right: 12 })
     .width('100%')
     .height(32)
-    .backgroundColor('#f0f0f0')
+    .backgroundColor(ColorResource.button_secondary_background)
   }
 }
 
@@ -866,7 +1030,7 @@ struct CompressDialog {
     }
     .padding(16)
     .width('90%')
-    .backgroundColor('#fff')
+    .backgroundColor(ColorResource.dialog_background)
     .borderRadius(16)
   }
 }
@@ -1008,7 +1172,7 @@ struct ExtractDialog {
           Text(this.dirPickerPath === this.sandboxRoot ?
             '应用沙箱' : this.dirPickerPath.substring(this.sandboxRoot.length + 1))
             .fontSize(12)
-            .fontColor('#666')
+            .fontColor(ColorResource.text_secondary)
             .width('100%')
             .padding({ left: 8, bottom: 4 })
 
@@ -1026,7 +1190,7 @@ struct ExtractDialog {
                     .layoutWeight(1)
                   Text('>')
                     .fontSize(16)
-                    .fontColor('#999')
+                    .fontColor(ColorResource.text_tertiary)
                 }
                 .padding({ left: 12, right: 12, top: 8, bottom: 8 })
                 .width('100%')
@@ -1052,8 +1216,8 @@ struct ExtractDialog {
                 this.confirmDir();
               })
               .margin(8)
-              .fontColor(Color.White)
-              .backgroundColor('#007aff')
+              .fontColor(ColorResource.text_inverse)
+              .backgroundColor(ColorResource.accent_primary)
           }
           .width('100%')
           .justifyContent(FlexAlign.Center)
@@ -1138,7 +1302,7 @@ struct ExtractDialog {
     .padding(16)
     .width('90%')
     .height(this.showDirPicker ? '80%' : 'auto')
-    .backgroundColor('#fff')
+    .backgroundColor(ColorResource.dialog_background)
     .borderRadius(16)
   }
 }
@@ -1168,8 +1332,8 @@ struct DeleteConfirmDialog {
           .onClick((): void => {
             this.controller?.close();
           })
-          .backgroundColor('#f0f0f0')
-          .fontColor(Color.Black)
+          .backgroundColor(ColorResource.button_secondary_background)
+          .fontColor(ColorResource.text_primary)
           .margin(8)
           .width(100)
           .height(40)
@@ -1181,8 +1345,8 @@ struct DeleteConfirmDialog {
               await this.onConfirm();
             }
           })
-          .backgroundColor('#ff4d4f')
-          .fontColor(Color.White)
+          .backgroundColor(ColorResource.button_danger_background)
+          .fontColor(ColorResource.text_inverse)
           .margin(8)
           .width(100)
           .height(40)
@@ -1193,7 +1357,7 @@ struct DeleteConfirmDialog {
     }
     .padding(16)
     .width('80%')
-    .backgroundColor('#fff')
+    .backgroundColor(ColorResource.dialog_background)
     .borderRadius(16)
   }
 }
