@@ -7,12 +7,23 @@
 #include <vector>
 #include <string>
 #include <cstdlib>
+#include <mutex>
+#include <unordered_set>
+#include <sys/stat.h>
+#include <errno.h>
 #include <hilog/log.h>
 #include "napi/native_api.h"
 #include <dlfcn.h>
 
 // 定义 p7zip main 函数类型
 typedef int (*p7zip_main_t)(int argc, const char* argv[]);
+
+// 全局互斥锁，保护 p7zipMain 调用
+static std::mutex g_p7zipMutex;
+
+// 全局库句柄和函数指针，避免频繁 dlopen/dlclose
+static void* g_p7zipHandle = nullptr;
+static p7zip_main_t g_p7zipMain = nullptr;
 
 /**
  * 异步工作上下文
@@ -44,37 +55,51 @@ static void ExecuteP7ZipOperation(napi_env env, void* data) {
     (void)env; // 避免未使用参数警告
     AsyncWorkContext* ctx = static_cast<AsyncWorkContext*>(data);
     
-    // 0. 如果是解压操作，先确保目标目录存在
-    if (ctx->operation == "extract") {
-        // 注意：在HarmonyOS上，mkdir -p 可能不可用
-        // 这里应该使用HarmonyOS的文件系统API来创建目录
-        // 暂时注释掉，因为p7zip应该能处理目录创建
-        // std::string mkdirCmd = "mkdir -p " + ctx->destPath;
-        // int mkdirRet = system(mkdirCmd.c_str());
-        // if (mkdirRet != 0) {
-        //     OH_LOG_WARN(LOG_APP, "mkdir returned %{public}d for path: %{public}s", mkdirRet, ctx->destPath.c_str());
-        // }
+    // 0. 验证参数：密码不能包含空格
+    if (!ctx->password.empty() && ctx->password.find(' ') != std::string::npos) {
+        ctx->exitCode = -20;
+        ctx->errorMsg = "Password must not contain spaces";
+        OH_LOG_ERROR(LOG_APP, "%{public}s", ctx->errorMsg.c_str());
+        return;
     }
     
-    // 1. 动态加载 p7zip 库
-    void* libHandle = dlopen("lib7za.so", RTLD_LAZY);
-    if (libHandle == nullptr) {
-        ctx->exitCode = -1;
-        ctx->errorMsg = "Failed to load lib7za.so: ";
-        ctx->errorMsg += dlerror();
-        OH_LOG_ERROR(LOG_APP, "%{public}s", ctx->errorMsg.c_str());
-        return;
+    // 1. 如果是解压操作，先确保目标目录存在
+    if (ctx->operation == "extract") {
+        // 7-Zip 的 x 命令要求 -o 指定的顶层目录必须已经存在
+        // 使用 mkdir 创建目录，如果目录已存在则忽略 EEXIST 错误
+        if (mkdir(ctx->destPath.c_str(), 0755) != 0 && errno != EEXIST) {
+            ctx->exitCode = -10;
+            ctx->errorMsg = "Failed to create destination directory: " + ctx->destPath + ", error: " + std::to_string(errno);
+            OH_LOG_ERROR(LOG_APP, "%{public}s", ctx->errorMsg.c_str());
+            return;
+        }
+        OH_LOG_INFO(LOG_APP, "Created or verified destination directory: %{public}s", ctx->destPath.c_str());
     }
+    
+    // 1. 检查库是否已加载
+    if (g_p7zipHandle == nullptr || g_p7zipMain == nullptr) {
+        // 首次使用，加载库
+        g_p7zipHandle = dlopen("lib7za.so", RTLD_NOW);
+        if (g_p7zipHandle == nullptr) {
+            ctx->exitCode = -1;
+            ctx->errorMsg = "Failed to load lib7za.so: ";
+            ctx->errorMsg += dlerror();
+            OH_LOG_ERROR(LOG_APP, "%{public}s", ctx->errorMsg.c_str());
+            return;
+        }
 
-    // 2. 获取 main 函数
-    auto p7zipMain = (p7zip_main_t)dlsym(libHandle, "main");
-    if (p7zipMain == nullptr) {
-        ctx->exitCode = -2;
-        ctx->errorMsg = "Failed to find 'main' function: ";
-        ctx->errorMsg += dlerror();
-        dlclose(libHandle);
-        OH_LOG_ERROR(LOG_APP, "%{public}s", ctx->errorMsg.c_str());
-        return;
+        // 获取 main 函数
+        g_p7zipMain = (p7zip_main_t)dlsym(g_p7zipHandle, "main");
+        if (g_p7zipMain == nullptr) {
+            ctx->exitCode = -2;
+            ctx->errorMsg = "Failed to find 'main' function: ";
+            ctx->errorMsg += dlerror();
+            dlclose(g_p7zipHandle);
+            g_p7zipHandle = nullptr;
+            OH_LOG_ERROR(LOG_APP, "%{public}s", ctx->errorMsg.c_str());
+            return;
+        }
+        OH_LOG_INFO(LOG_APP, "Loaded lib7za.so successfully");
     }
 
     // 3. 根据操作类型构建命令行参数
@@ -138,41 +163,29 @@ static void ExecuteP7ZipOperation(napi_env env, void* data) {
         argv.push_back(arg.c_str());
     }
     
-    argv.push_back(nullptr); // 参数数组结尾
+    // 注意：p7zipMain 接收 argc 参数，不需要 NULL 哨兵
+    // argv.push_back(nullptr); // 参数数组结尾（不再需要）
 
-    // 4. 打印所有参数用于调试
-    OH_LOG_INFO(LOG_APP, "Executing p7zip with %{public}d args:", (int)(argv.size() - 1));
-    // 先打印 argStorage 的内容
-    OH_LOG_INFO(LOG_APP, "argStorage contents:");
+    // 4. 打印所有参数用于调试（避免输出密码等敏感信息）
+    OH_LOG_INFO(LOG_APP, "Executing p7zip with %{public}d args for operation: %{public}s", 
+                (int)(argv.size() - 1), ctx->operation.c_str());
+    
+    // 安全地打印参数，隐藏密码信息
+    OH_LOG_INFO(LOG_APP, "argStorage contents (sanitized):");
     for (size_t i = 0; i < argStorage.size(); i++) {
-        OH_LOG_INFO(LOG_APP, "  argStorage[%{public}zu] = \"%{public}s\"", i, argStorage[i].c_str());
-    }
-    // 再打印 argv 的内容
-    OH_LOG_INFO(LOG_APP, "argv contents:");
-    for (size_t i = 0; i < argv.size() - 1; i++) {
-        OH_LOG_INFO(LOG_APP, "  argv[%{public}zu] = \"%{public}s\"", i, argv[i]);
-    }
-    
-    // 5. 调用 p7zip main 函数，使用 try-catch 保护
-    try {
-        ctx->exitCode = p7zipMain(static_cast<int>(argv.size() - 1), argv.data());
-    } catch (const std::exception& e) {
-        ctx->exitCode = -3;
-        ctx->errorMsg = "p7zip main threw exception: ";
-        ctx->errorMsg += e.what();
-        OH_LOG_ERROR(LOG_APP, "%{public}s", ctx->errorMsg.c_str());
-        dlclose(libHandle);
-        return;
-    } catch (...) {
-        ctx->exitCode = -4;
-        ctx->errorMsg = "p7zip main threw unknown exception";
-        OH_LOG_ERROR(LOG_APP, "%{public}s", ctx->errorMsg.c_str());
-        dlclose(libHandle);
-        return;
+        // 检查是否是密码参数，如果是则隐藏
+        if (argStorage[i].size() > 2 && argStorage[i][0] == '-' && argStorage[i][1] == 'p') {
+            // 密码参数，只显示前2个字符
+            OH_LOG_INFO(LOG_APP, "  argStorage[%{public}zu] = \"-p****\"", i);
+        } else {
+            OH_LOG_INFO(LOG_APP, "  argStorage[%{public}zu] = \"%{public}s\"", i, argStorage[i].c_str());
+        }
     }
     
-    // 5. 清理库句柄
-    dlclose(libHandle);
+    // 5. 调用 p7zip main 函数，使用互斥锁保护，防止并发访问
+    // p7zipMain 是 C 函数，不应该抛出 C++ 异常，但我们仍然使用互斥锁保护
+    std::lock_guard<std::mutex> lock(g_p7zipMutex);
+    ctx->exitCode = g_p7zipMain(static_cast<int>(argv.size()), argv.data());
 
     if (ctx->exitCode != 0) {
         ctx->errorMsg = "p7zip operation failed with exit code: " + std::to_string(ctx->exitCode);
@@ -195,21 +208,76 @@ static void ExecuteP7ZipOperation(napi_env env, void* data) {
  * 操作完成回调（在主JS线程执行）
  */
 static void OnP7ZipOperationComplete(napi_env env, napi_status status, void* data) {
-    (void)status; // 避免未使用参数警告
     AsyncWorkContext* ctx = static_cast<AsyncWorkContext*>(data);
-    
-    if (ctx->exitCode == 0) {
-        napi_value result;
-        napi_get_boolean(env, true, &result);
-        napi_resolve_deferred(env, ctx->deferred, result);
-    } else {
-        napi_value errorMsg;
-        napi_create_string_utf8(env, ctx->errorMsg.c_str(), NAPI_AUTO_LENGTH, &errorMsg);
-        napi_reject_deferred(env, ctx->deferred, errorMsg);
+
+    // 如果异步工作被取消或失败，直接清理资源，不操作 Promise
+    if (status != napi_ok) {
+        OH_LOG_ERROR(LOG_APP, "Async work cancelled or failed, status: %{public}d", status);
+        // 不操作 deferred，Promises 由引擎处理
+        napi_delete_async_work(env, ctx->work);
+        delete ctx;
+        return;
     }
     
-    napi_delete_async_work(env, ctx->work);
+    // 只有 status == napi_ok 时才处理结果
+    if (ctx->exitCode == 0) {
+        napi_value result;
+        napi_status napiStatus = napi_get_boolean(env, true, &result);
+        if (napiStatus == napi_ok) {
+            napiStatus = napi_resolve_deferred(env, ctx->deferred, result);
+            if (napiStatus != napi_ok) {
+                OH_LOG_ERROR(LOG_APP, "Failed to resolve promise, status: %{public}d", napiStatus);
+            }
+        } else {
+            OH_LOG_ERROR(LOG_APP, "Failed to create boolean result, status: %{public}d", napiStatus);
+            // 创建错误消息并拒绝Promise
+            napi_value errorMsg;
+            napiStatus = napi_create_string_utf8(env, "Internal error: failed to create result", NAPI_AUTO_LENGTH, &errorMsg);
+            if (napiStatus == napi_ok) {
+                napi_reject_deferred(env, ctx->deferred, errorMsg);
+            }
+        }
+    } else {
+        napi_value errorMsg;
+        napi_status napiStatus = napi_create_string_utf8(env, ctx->errorMsg.c_str(), NAPI_AUTO_LENGTH, &errorMsg);
+        if (napiStatus == napi_ok) {
+            napiStatus = napi_reject_deferred(env, ctx->deferred, errorMsg);
+            if (napiStatus != napi_ok) {
+                OH_LOG_ERROR(LOG_APP, "Failed to reject promise, status: %{public}d", napiStatus);
+            }
+        } else {
+            OH_LOG_ERROR(LOG_APP, "Failed to create error message, status: %{public}d", napiStatus);
+            // 创建默认错误消息
+            napiStatus = napi_create_string_utf8(env, "Operation failed with unknown error", NAPI_AUTO_LENGTH, &errorMsg);
+            if (napiStatus == napi_ok) {
+                napi_reject_deferred(env, ctx->deferred, errorMsg);
+            }
+        }
+    }
+    
+    // 清理异步工作资源
+    napi_status deleteStatus = napi_delete_async_work(env, ctx->work);
+    if (deleteStatus != napi_ok) {
+        OH_LOG_ERROR(LOG_APP, "Failed to delete async work, status: %{public}d", deleteStatus);
+    }
+    
     delete ctx;
+}
+
+/**
+ * 检查压缩格式是否受支持
+ */
+static bool IsSupportedFormat(const std::string& format) {
+    // 7-Zip 支持的主要格式
+    static const std::unordered_set<std::string> supportedFormats = {
+        "7z", "zip", "gzip", "bzip2", "tar", "xz", "lzma", "cab", "arj",
+        "z", "lzh", "rar", "iso", "chm", "msi", "wim", "udf", "fat",
+        "ntfs", "exfat", "apfs", "hfs", "hfsx", "ext", "ext2", "ext3",
+        "ext4", "squashfs", "cramfs", "vhd", "vmdk", "vdi", "qcow",
+        "qcow2", "dmg", "hdd", "mbr", "gpt", "apm", "mac", "udf",
+        "xar", "rpm", "deb", "cpio", "swf", "flv", "swfc", "lit"
+    };
+    return supportedFormats.find(format) != supportedFormats.end();
 }
 
 /**
@@ -219,11 +287,40 @@ static std::string GetStringFromNapiValue(napi_env env, napi_value value) {
     if (value == nullptr) {
         return "";
     }
+    
+    napi_valuetype type;
+    napi_status status = napi_typeof(env, value, &type);
+    if (status != napi_ok) {
+        OH_LOG_ERROR(LOG_APP, "napi_typeof failed with status: %{public}d", status);
+        return "";
+    }
+    
+    if (type != napi_string) {
+        // 如果不是字符串，尝试自动转换
+        napi_value strValue;
+        status = napi_coerce_to_string(env, value, &strValue);
+        if (status != napi_ok) {
+            OH_LOG_ERROR(LOG_APP, "napi_coerce_to_string failed with status: %{public}d", status);
+            return "";
+        }
+        value = strValue;
+    }
+    
     size_t len = 0;
-    napi_get_value_string_utf8(env, value, nullptr, 0, &len);
+    status = napi_get_value_string_utf8(env, value, nullptr, 0, &len);
+    if (status != napi_ok) {
+        OH_LOG_ERROR(LOG_APP, "napi_get_value_string_utf8 (length) failed with status: %{public}d", status);
+        return "";
+    }
+    
     std::string result(len, '\0');
     if (len > 0) {
-        napi_get_value_string_utf8(env, value, &result[0], len + 1, &len);
+        size_t actualLen = 0;
+        status = napi_get_value_string_utf8(env, value, &result[0], len + 1, &actualLen);
+        if (status != napi_ok) {
+            OH_LOG_ERROR(LOG_APP, "napi_get_value_string_utf8 failed with status: %{public}d", status);
+            return "";
+        }
     }
     return result;
 }
@@ -234,25 +331,65 @@ static std::string GetStringFromNapiValue(napi_env env, napi_value value) {
 static napi_value Compress(napi_env env, napi_callback_info info) {
     size_t argc = 3;
     napi_value args[3];
-    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    napi_valuetype argTypes[3];
+    
+    // 获取函数参数信息
+    napi_status status = napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (status != napi_ok) {
+        napi_throw_error(env, nullptr, "Failed to get callback info");
+        return nullptr;
+    }
 
     if (argc < 2) {
         napi_throw_error(env, nullptr, "Wrong number of arguments. Expected at least: srcPaths[], destArchive");
         return nullptr;
     }
 
+    // 检查第一个参数是否为数组
+    status = napi_typeof(env, args[0], &argTypes[0]);
+    if (status != napi_ok || argTypes[0] != napi_object) {
+        napi_throw_type_error(env, nullptr, "First argument must be an array");
+        return nullptr;
+    }
+    
+    bool isArray = false;
+    status = napi_is_array(env, args[0], &isArray);
+    if (status != napi_ok || !isArray) {
+        napi_throw_type_error(env, nullptr, "First argument must be an array");
+        return nullptr;
+    }
+
     // 1. 解析源路径数组
     uint32_t arrayLength = 0;
-    napi_get_array_length(env, args[0], &arrayLength);
+    status = napi_get_array_length(env, args[0], &arrayLength);
+    if (status != napi_ok) {
+        napi_throw_error(env, nullptr, "Failed to get array length");
+        return nullptr;
+    }
+    
     std::vector<std::string> srcPaths;
     for (uint32_t i = 0; i < arrayLength; i++) {
         napi_value element;
-        napi_get_element(env, args[0], i, &element);
+        status = napi_get_element(env, args[0], i, &element);
+        if (status != napi_ok) {
+            napi_throw_error(env, nullptr, "Failed to get array element");
+            return nullptr;
+        }
         srcPaths.push_back(GetStringFromNapiValue(env, element));
+    }
+
+    // 检查源路径数组不能为空
+    if (srcPaths.empty()) {
+        napi_throw_error(env, nullptr, "Source paths array must not be empty");
+        return nullptr;
     }
 
     // 2. 解析目标压缩包路径
     std::string destPath = GetStringFromNapiValue(env, args[1]);
+    if (destPath.empty()) {
+        napi_throw_error(env, nullptr, "Destination path cannot be empty");
+        return nullptr;
+    }
 
     // 3. 解析选项对象（第三个参数，可选）
     std::string format = "7z";
@@ -261,37 +398,70 @@ static napi_value Compress(napi_env env, napi_callback_info info) {
     
     if (argc >= 3) {
         napi_valuetype type;
-        napi_typeof(env, args[2], &type);
-        if (type == napi_object) {
+        status = napi_typeof(env, args[2], &type);
+        if (status == napi_ok && type == napi_object) {
             napi_value formatVal, passwordVal, levelVal;
             bool hasProp = false;
             
-            napi_has_named_property(env, args[2], "format", &hasProp);
-            if (hasProp) {
-                napi_get_named_property(env, args[2], "format", &formatVal);
-                format = GetStringFromNapiValue(env, formatVal);
+            status = napi_has_named_property(env, args[2], "format", &hasProp);
+            if (status == napi_ok && hasProp) {
+                status = napi_get_named_property(env, args[2], "format", &formatVal);
+                if (status == napi_ok) {
+                    format = GetStringFromNapiValue(env, formatVal);
+                }
             }
             
-            napi_has_named_property(env, args[2], "password", &hasProp);
-            if (hasProp) {
-                napi_get_named_property(env, args[2], "password", &passwordVal);
-                password = GetStringFromNapiValue(env, passwordVal);
+            status = napi_has_named_property(env, args[2], "password", &hasProp);
+            if (status == napi_ok && hasProp) {
+                status = napi_get_named_property(env, args[2], "password", &passwordVal);
+                if (status == napi_ok) {
+                    password = GetStringFromNapiValue(env, passwordVal);
+                }
             }
             
-            napi_has_named_property(env, args[2], "level", &hasProp);
-            if (hasProp) {
-                napi_get_named_property(env, args[2], "level", &levelVal);
-                level = "-mx=" + GetStringFromNapiValue(env, levelVal);
+            status = napi_has_named_property(env, args[2], "level", &hasProp);
+            if (status == napi_ok && hasProp) {
+                status = napi_get_named_property(env, args[2], "level", &levelVal);
+                if (status == napi_ok) {
+                    level = "-mx=" + GetStringFromNapiValue(env, levelVal);
+                }
             }
         }
+    }
+    
+    // 验证密码不能包含空格
+    if (!password.empty() && password.find(' ') != std::string::npos) {
+        napi_throw_error(env, nullptr, "Password must not contain spaces");
+        return nullptr;
+    }
+    
+    // 验证压缩格式不能包含空格
+    if (!format.empty() && format.find(' ') != std::string::npos) {
+        napi_throw_error(env, nullptr, "Format must not contain spaces");
+        return nullptr;
+    }
+    
+    // 验证压缩格式是否受支持
+    if (!format.empty() && !IsSupportedFormat(format)) {
+        napi_throw_error(env, nullptr, ("Unsupported compression format: " + format).c_str());
+        return nullptr;
     }
 
     // 4. 创建异步工作和Promise
     napi_deferred deferred;
     napi_value promise;
-    napi_create_promise(env, &deferred, &promise);
+    status = napi_create_promise(env, &deferred, &promise);
+    if (status != napi_ok) {
+        napi_throw_error(env, nullptr, "Failed to create promise");
+        return nullptr;
+    }
 
-    AsyncWorkContext* ctx = new AsyncWorkContext();
+    AsyncWorkContext* ctx = new (std::nothrow) AsyncWorkContext();
+    if (ctx == nullptr) {
+        napi_throw_error(env, nullptr, "Failed to allocate memory for async context");
+        return nullptr;
+    }
+    
     ctx->env = env;
     ctx->deferred = deferred;
     ctx->operation = "compress";
@@ -302,12 +472,30 @@ static napi_value Compress(napi_env env, napi_callback_info info) {
     ctx->level = level;
 
     napi_value resourceName;
-    napi_create_string_utf8(env, "CompressOperation", NAPI_AUTO_LENGTH, &resourceName);
-    napi_create_async_work(env, nullptr, resourceName,
-                          ExecuteP7ZipOperation,
-                          OnP7ZipOperationComplete,
-                          ctx, &ctx->work);
-    napi_queue_async_work(env, ctx->work);
+    status = napi_create_string_utf8(env, "CompressOperation", NAPI_AUTO_LENGTH, &resourceName);
+    if (status != napi_ok) {
+        delete ctx;
+        napi_throw_error(env, nullptr, "Failed to create resource name");
+        return nullptr;
+    }
+    
+    status = napi_create_async_work(env, nullptr, resourceName,
+                                   ExecuteP7ZipOperation,
+                                   OnP7ZipOperationComplete,
+                                   ctx, &ctx->work);
+    if (status != napi_ok) {
+        delete ctx;
+        napi_throw_error(env, nullptr, "Failed to create async work");
+        return nullptr;
+    }
+    
+    status = napi_queue_async_work(env, ctx->work);
+    if (status != napi_ok) {
+        napi_delete_async_work(env, ctx->work);
+        delete ctx;
+        napi_throw_error(env, nullptr, "Failed to queue async work");
+        return nullptr;
+    }
 
     return promise;
 }
@@ -318,7 +506,14 @@ static napi_value Compress(napi_env env, napi_callback_info info) {
 static napi_value Extract(napi_env env, napi_callback_info info) {
     size_t argc = 3;
     napi_value args[3];
-    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    napi_valuetype argTypes[3];
+    
+    // 获取函数参数信息
+    napi_status status = napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (status != napi_ok) {
+        napi_throw_error(env, nullptr, "Failed to get callback info");
+        return nullptr;
+    }
 
     if (argc < 2) {
         napi_throw_error(env, nullptr, "Wrong number of arguments. Expected at least: archivePath, destDir");
@@ -327,22 +522,45 @@ static napi_value Extract(napi_env env, napi_callback_info info) {
 
     // 1. 解析源压缩包路径
     std::string archivePath = GetStringFromNapiValue(env, args[0]);
+    if (archivePath.empty()) {
+        napi_throw_error(env, nullptr, "Archive path cannot be empty");
+        return nullptr;
+    }
 
     // 2. 解析目标目录
     std::string destDir = GetStringFromNapiValue(env, args[1]);
+    if (destDir.empty()) {
+        napi_throw_error(env, nullptr, "Destination directory cannot be empty");
+        return nullptr;
+    }
 
     // 3. 解析密码（第三个参数，可选）
     std::string password;
     if (argc >= 3) {
         password = GetStringFromNapiValue(env, args[2]);
     }
+    
+    // 验证密码不能包含空格
+    if (!password.empty() && password.find(' ') != std::string::npos) {
+        napi_throw_error(env, nullptr, "Password must not contain spaces");
+        return nullptr;
+    }
 
     // 4. 创建异步工作和Promise
     napi_deferred deferred;
     napi_value promise;
-    napi_create_promise(env, &deferred, &promise);
+    status = napi_create_promise(env, &deferred, &promise);
+    if (status != napi_ok) {
+        napi_throw_error(env, nullptr, "Failed to create promise");
+        return nullptr;
+    }
 
-    AsyncWorkContext* ctx = new AsyncWorkContext();
+    AsyncWorkContext* ctx = new (std::nothrow) AsyncWorkContext();
+    if (ctx == nullptr) {
+        napi_throw_error(env, nullptr, "Failed to allocate memory for async context");
+        return nullptr;
+    }
+    
     ctx->env = env;
     ctx->deferred = deferred;
     ctx->operation = "extract";
@@ -351,12 +569,30 @@ static napi_value Extract(napi_env env, napi_callback_info info) {
     ctx->password = password;
 
     napi_value resourceName;
-    napi_create_string_utf8(env, "ExtractOperation", NAPI_AUTO_LENGTH, &resourceName);
-    napi_create_async_work(env, nullptr, resourceName,
-                          ExecuteP7ZipOperation,
-                          OnP7ZipOperationComplete,
-                          ctx, &ctx->work);
-    napi_queue_async_work(env, ctx->work);
+    status = napi_create_string_utf8(env, "ExtractOperation", NAPI_AUTO_LENGTH, &resourceName);
+    if (status != napi_ok) {
+        delete ctx;
+        napi_throw_error(env, nullptr, "Failed to create resource name");
+        return nullptr;
+    }
+    
+    status = napi_create_async_work(env, nullptr, resourceName,
+                                   ExecuteP7ZipOperation,
+                                   OnP7ZipOperationComplete,
+                                   ctx, &ctx->work);
+    if (status != napi_ok) {
+        delete ctx;
+        napi_throw_error(env, nullptr, "Failed to create async work");
+        return nullptr;
+    }
+    
+    status = napi_queue_async_work(env, ctx->work);
+    if (status != napi_ok) {
+        napi_delete_async_work(env, ctx->work);
+        delete ctx;
+        napi_throw_error(env, nullptr, "Failed to queue async work");
+        return nullptr;
+    }
 
     return promise;
 }
@@ -370,7 +606,13 @@ static napi_value Init(napi_env env, napi_value exports) {
         {"compress", nullptr, Compress, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"extract", nullptr, Extract, nullptr, nullptr, nullptr, napi_default, nullptr}
     };
-    napi_define_properties(env, exports, sizeof(desc) / sizeof(desc[0]), desc);
+    
+    napi_status status = napi_define_properties(env, exports, sizeof(desc) / sizeof(desc[0]), desc);
+    if (status != napi_ok) {
+        OH_LOG_ERROR(LOG_APP, "Failed to define properties, status: %{public}d", status);
+        // 返回原始exports，不抛出错误，因为这是模块初始化
+    }
+    
     return exports;
 }
 EXTERN_C_END
@@ -385,6 +627,23 @@ static napi_module demoModule = {
     .reserved = {0},
 };
 
+/**
+ * 模块卸载清理函数
+ */
+static void CleanupP7ZipLibrary() {
+    if (g_p7zipHandle != nullptr) {
+        dlclose(g_p7zipHandle);
+        g_p7zipHandle = nullptr;
+        g_p7zipMain = nullptr;
+        OH_LOG_INFO(LOG_APP, "Unloaded lib7za.so");
+    }
+}
+
 extern "C" __attribute__((constructor)) void RegisterEntryModule(void) {
     napi_module_register(&demoModule);
+}
+
+// 注册模块卸载时的清理函数
+extern "C" __attribute__((destructor)) void UnregisterEntryModule(void) {
+    CleanupP7ZipLibrary();
 }

@@ -434,6 +434,108 @@ struct FileBrowser {
     }
   }
 
+  // ---------- 导出功能 ----------
+
+  /**
+   * 打开文件保存对话框，将选中的文件导出到用户选择的位置
+   */
+  async exportFiles(): Promise<void> {
+    try {
+      // 检查是否有选中的文件
+      const selectedPaths = this.getSelectedPaths();
+      if (selectedPaths.length === 0) {
+        showToast('请先选择要导出的文件或文件夹');
+        return;
+      }
+
+      // 检查picker API是否可用
+      if (!canIUse('SystemCapability.FileManagement.UserFileService')) {
+        showToast('当前设备不支持文件保存功能');
+        return;
+      }
+      
+      // 创建文件保存对话框
+      const documentPicker = new picker.DocumentViewPicker();
+      
+      // 逐个处理选中的文件
+      let successCount = 0;
+      for (const sourcePath of selectedPaths) {
+        try {
+          // 获取文件名
+          const fileName = sourcePath.split('/').pop() || 'file';
+          
+          // 创建保存选项
+          const documentSaveOptions = new picker.DocumentSaveOptions();
+          documentSaveOptions.newFileNames = [fileName];
+          
+          // 打开保存对话框，让用户选择保存位置
+          const result = await documentPicker.save(documentSaveOptions);
+          
+          if (!result || result.length === 0) {
+            // 用户取消保存当前文件，继续处理下一个
+            continue;
+          }
+          
+          // 获取保存的URI
+          const destUri = result[0];
+          
+          // 复制文件到用户选择的位置
+          await this.copyFileToPublicDir(sourcePath, destUri);
+          successCount++;
+        } catch (err) {
+          console.error('导出文件失败: ' + sourcePath, JSON.stringify(err));
+        }
+      }
+      
+      if (successCount > 0) {
+        showToast('成功导出 ' + successCount + ' 个文件');
+      } else {
+        showToast('未导出任何文件');
+      }
+      
+      // 刷新文件列表
+      this.refresh();
+    } catch (err) {
+      const bizErr = err as BusinessError;
+      if (bizErr.code === 0) {
+        // 用户取消选择，不提示
+        return;
+      }
+      showToast('导出失败: ' + bizErr.message);
+      console.error('导出文件失败', JSON.stringify(err));
+    }
+  }
+
+  /**
+   * 将文件从沙箱复制到用户选择的公共目录
+   */
+  async copyFileToPublicDir(sourcePath: string, destUri: string): Promise<void> {
+    try {
+      // 打开源文件（只读）
+      const srcFile = fileIo.openSync(sourcePath, fileIo.OpenMode.READ_ONLY);
+      
+      // 打开目标文件（读写，若存在则覆盖）
+      const destFile = fileIo.openSync(destUri, fileIo.OpenMode.CREATE | fileIo.OpenMode.WRITE_ONLY);
+      
+      // 复制文件内容
+      const bufSize = 1024 * 1024; // 1MB 缓冲区
+      const buf = new ArrayBuffer(bufSize);
+      let bytesRead = fileIo.readSync(srcFile.fd, buf);
+      while (bytesRead > 0) {
+        const writeBuf = buf.slice(0, bytesRead);
+        fileIo.writeSync(destFile.fd, writeBuf);
+        bytesRead = fileIo.readSync(srcFile.fd, buf);
+      }
+      
+      // 关闭文件
+      fileIo.closeSync(srcFile.fd);
+      fileIo.closeSync(destFile.fd);
+    } catch (err) {
+      console.error('复制文件失败', JSON.stringify(err));
+      throw new Error('复制文件失败: ' + JSON.stringify(err));
+    }
+  }
+
   // ---------- UI 构建 ----------
   build() {
     Column() {
@@ -597,6 +699,18 @@ struct FileBrowser {
           .fontSize(14)
           .height(36)
         Blank()
+        Button('导出')
+          .onClick((): void => {
+            try {
+              this.exportFiles();
+            } catch (err) {
+              console.error('导出失败', JSON.stringify(err));
+              showToast('导出失败');
+            }
+          })
+          .fontSize(14)
+          .height(36)
+        Blank()
         Button('删除')
           .onClick((): void => {
             try {
@@ -624,6 +738,18 @@ struct FileBrowser {
             } catch (err) {
               console.error('导入失败', JSON.stringify(err));
               showToast('导入失败');
+            }
+          })
+          .fontSize(14)
+          .height(36)
+        Blank()
+        Button('导出')
+          .onClick((): void => {
+            try {
+              this.exportFiles();
+            } catch (err) {
+              console.error('导出失败', JSON.stringify(err));
+              showToast('导出失败');
             }
           })
           .fontSize(14)
