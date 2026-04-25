@@ -3,6 +3,7 @@
 #define LOG_DOMAIN 0xFF00
 #define LOG_TAG "P7ZipBridge"
 
+#include <atomic>
 #include <thread>
 #include <vector>
 #include <string>
@@ -24,6 +25,76 @@ static std::mutex g_p7zipMutex;
 // 全局库句柄和函数指针，避免频繁 dlopen/dlclose
 static void* g_p7zipHandle = nullptr;
 static p7zip_main_t g_p7zipMain = nullptr;
+static std::once_flag g_initFlag;
+static std::atomic<bool> g_libraryLoaded{false};
+
+// 原子标志，用于跟踪是否有操作正在进行
+static std::atomic<int> g_activeOperations{0};
+
+/**
+ * 确保库只被加载一次（线程安全）
+ */
+static void EnsureLibraryLoaded() {
+    std::call_once(g_initFlag, [](){
+        g_p7zipHandle = dlopen("lib7za.so", RTLD_NOW);
+        if (!g_p7zipHandle) {
+            OH_LOG_ERROR(LOG_APP, "Failed to load lib7za.so: %{public}s", dlerror());
+            return;
+        }
+        
+        g_p7zipMain = (p7zip_main_t)dlsym(g_p7zipHandle, "main");
+        if (!g_p7zipMain) {
+            OH_LOG_ERROR(LOG_APP, "Failed to find 'main' function: %{public}s", dlerror());
+            dlclose(g_p7zipHandle);
+            g_p7zipHandle = nullptr;
+            return;
+        }
+        
+        g_libraryLoaded = true;
+        OH_LOG_INFO(LOG_APP, "Loaded lib7za.so successfully");
+    });
+}
+
+/**
+ * 递归创建目录（类似 mkdir -p）
+ */
+static bool CreateDirectoryRecursive(const std::string& path) {
+    if (path.empty()) {
+        return false;
+    }
+    
+    // 检查目录是否已存在
+    struct stat st;
+    if (stat(path.c_str(), &st) == 0) {
+        if (S_ISDIR(st.st_mode)) {
+            return true; // 目录已存在
+        }
+        return false; // 路径存在但不是目录
+    }
+    
+    // 创建父目录
+    size_t pos = path.find_last_of('/');
+    if (pos != std::string::npos) {
+        std::string parent = path.substr(0, pos);
+        if (!parent.empty() && !CreateDirectoryRecursive(parent)) {
+            return false;
+        }
+    }
+    
+    // 创建当前目录
+    if (mkdir(path.c_str(), 0755) != 0) {
+        if (errno == EEXIST) {
+            // 检查是否真的是目录
+            if (stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
+                return true;
+            }
+            return false; // 存在但不是目录
+        }
+        return false; // 创建失败
+    }
+    
+    return true;
+}
 
 /**
  * 异步工作上下文
@@ -66,8 +137,8 @@ static void ExecuteP7ZipOperation(napi_env env, void* data) {
     // 1. 如果是解压操作，先确保目标目录存在
     if (ctx->operation == "extract") {
         // 7-Zip 的 x 命令要求 -o 指定的顶层目录必须已经存在
-        // 使用 mkdir 创建目录，如果目录已存在则忽略 EEXIST 错误
-        if (mkdir(ctx->destPath.c_str(), 0755) != 0 && errno != EEXIST) {
+        // 使用递归创建目录，确保多级目录都能被创建
+        if (!CreateDirectoryRecursive(ctx->destPath)) {
             ctx->exitCode = -10;
             ctx->errorMsg = "Failed to create destination directory: " + ctx->destPath + ", error: " + std::to_string(errno);
             OH_LOG_ERROR(LOG_APP, "%{public}s", ctx->errorMsg.c_str());
@@ -76,30 +147,13 @@ static void ExecuteP7ZipOperation(napi_env env, void* data) {
         OH_LOG_INFO(LOG_APP, "Created or verified destination directory: %{public}s", ctx->destPath.c_str());
     }
     
-    // 1. 检查库是否已加载
-    if (g_p7zipHandle == nullptr || g_p7zipMain == nullptr) {
-        // 首次使用，加载库
-        g_p7zipHandle = dlopen("lib7za.so", RTLD_NOW);
-        if (g_p7zipHandle == nullptr) {
-            ctx->exitCode = -1;
-            ctx->errorMsg = "Failed to load lib7za.so: ";
-            ctx->errorMsg += dlerror();
-            OH_LOG_ERROR(LOG_APP, "%{public}s", ctx->errorMsg.c_str());
-            return;
-        }
-
-        // 获取 main 函数
-        g_p7zipMain = (p7zip_main_t)dlsym(g_p7zipHandle, "main");
-        if (g_p7zipMain == nullptr) {
-            ctx->exitCode = -2;
-            ctx->errorMsg = "Failed to find 'main' function: ";
-            ctx->errorMsg += dlerror();
-            dlclose(g_p7zipHandle);
-            g_p7zipHandle = nullptr;
-            OH_LOG_ERROR(LOG_APP, "%{public}s", ctx->errorMsg.c_str());
-            return;
-        }
-        OH_LOG_INFO(LOG_APP, "Loaded lib7za.so successfully");
+    // 1. 确保库已加载（线程安全）
+    EnsureLibraryLoaded();
+    if (!g_libraryLoaded || g_p7zipHandle == nullptr || g_p7zipMain == nullptr) {
+        ctx->exitCode = -1;
+        ctx->errorMsg = "Failed to load lib7za.so library";
+        OH_LOG_ERROR(LOG_APP, "%{public}s", ctx->errorMsg.c_str());
+        return;
     }
 
     // 3. 根据操作类型构建命令行参数
@@ -185,7 +239,9 @@ static void ExecuteP7ZipOperation(napi_env env, void* data) {
     // 5. 调用 p7zip main 函数，使用互斥锁保护，防止并发访问
     // p7zipMain 是 C 函数，不应该抛出 C++ 异常，但我们仍然使用互斥锁保护
     std::lock_guard<std::mutex> lock(g_p7zipMutex);
+    g_activeOperations++;  // 增加活动操作计数
     ctx->exitCode = g_p7zipMain(static_cast<int>(argv.size()), argv.data());
+    g_activeOperations--;  // 减少活动操作计数
 
     if (ctx->exitCode != 0) {
         ctx->errorMsg = "p7zip operation failed with exit code: " + std::to_string(ctx->exitCode);
@@ -631,10 +687,31 @@ static napi_module demoModule = {
  * 模块卸载清理函数
  */
 static void CleanupP7ZipLibrary() {
+    // 等待所有活动操作完成
+    int maxWaitTime = 5000; // 最多等待5秒
+    int waitInterval = 100; // 每次等待100毫秒
+    int totalWaited = 0;
+    
+    while (g_activeOperations > 0 && totalWaited < maxWaitTime) {
+        // 使用简单的忙等待，在模块卸载时这是可以接受的
+        std::this_thread::sleep_for(std::chrono::milliseconds(waitInterval));
+        totalWaited += waitInterval;
+    }
+    
+    if (g_activeOperations > 0) {
+        OH_LOG_WARN(LOG_APP, "Force unloading library while %{public}d operations are still active", 
+                   g_activeOperations.load());
+    }
+    
+    // 获取互斥锁以确保没有并发访问
+    std::lock_guard<std::mutex> lock(g_p7zipMutex);
+    
     if (g_p7zipHandle != nullptr) {
         dlclose(g_p7zipHandle);
         g_p7zipHandle = nullptr;
         g_p7zipMain = nullptr;
+        g_libraryLoaded = false;
+        
         OH_LOG_INFO(LOG_APP, "Unloaded lib7za.so");
     }
 }
