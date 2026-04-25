@@ -1,3 +1,5 @@
+import abilityAccessCtrl, { Permissions, PermissionRequestResult } from '@ohos.abilityAccessCtrl';
+import { common } from '@kit.AbilityKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { picker } from '@kit.CoreFileKit';
 import { fileIo } from '@kit.CoreFileKit';
@@ -5,7 +7,6 @@ import * as native from 'libentry.so';
 import { showToast } from '../utils/ToastUtil';
 import { FileRow } from '../components/FileRow';
 import { FileGridCell } from '../components/FileGridCell';
-
 
 // 临时定义权限类型（如果从 SDK 导入失败）
 
@@ -195,8 +196,8 @@ struct FileBrowser {
       builder: ExtractDialog({
         archivePath: first.path,
         sandboxRoot: this.getSandboxRoot(),
-        onConfirm: async (destPath: string, password?: string): Promise<void> => {
-          await this.startExtract(first.path, destPath, password);
+        onConfirm: (destPath: string, password?: string): void => {
+          this.startExtract(first.path, destPath, password);
         }
       }),
       cancel: (): void => { this.extractDialogController?.close(); }
@@ -207,76 +208,35 @@ struct FileBrowser {
   async startExtract(archivePath: string, destPath: string, password?: string): Promise<void> {
     this.isLoading = true;
     try {
-      console.info('开始解压操作:', { archivePath, destPath, password });
-      
-      // 0. 验证路径
-      if (!archivePath || !destPath) {
-        showToast('解压失败: 路径不能为空');
-        return;
-      }
-      
-      // 确保目标路径在沙箱内
-      const sandboxRoot = this.getSandboxRoot();
-      if (!destPath.startsWith(sandboxRoot)) {
-        console.error('目标路径不在沙箱内:', { destPath, sandboxRoot });
-        showToast('解压失败: 目标路径必须在应用沙箱内');
-        return;
-      }
-
       // 1. 检查压缩文件是否存在
       try {
-        const stat = fileIo.statSync(archivePath);
-        console.info('压缩文件状态:', { path: archivePath, isFile: stat.isFile(), isDirectory: stat.isDirectory() });
-        
-        if (!stat.isFile()) {
-          showToast('解压失败: 选择的不是文件');
-          return;
-        }
+        fileIo.statSync(archivePath);
       } catch (statErr) {
-        console.error('压缩文件不存在: ' + archivePath, JSON.stringify(statErr));
         showToast('解压失败: 压缩文件不存在');
+        console.error('压缩文件不存在: ' + archivePath, JSON.stringify(statErr));
         return;
       }
 
       // 2. 确保目标目录存在（如果不存在则创建）
-      console.info('创建目标目录:', destPath);
       try {
-        // 先检查目标路径是否已经是文件
-        try {
-          const destStat = fileIo.statSync(destPath);
-          if (destStat.isFile()) {
-            showToast('解压失败: 目标路径是文件，不是目录');
-            return;
-          }
-        } catch (e) {
-          // 路径不存在，继续创建
-        }
-        
         fileIo.mkdirSync(destPath, true); // recursive = true
-        console.info('目录创建成功或已存在:', destPath);
       } catch (mkdirErr) {
-        console.error('创建目录失败:', destPath, JSON.stringify(mkdirErr));
-        showToast('解压失败: 无法创建目标目录');
-        return;
+        // 如果目录已存在，忽略错误
+        console.info('创建目录（可能已存在）: ' + destPath);
       }
 
       // 3. 执行解压
-      console.info('调用原生解压接口...');
       await native.extract(archivePath, destPath, password);
-      console.info('解压操作完成');
       showToast('解压成功');
-      
-      // 4. 刷新文件列表
       this.refresh();
     } catch (err) {
       const errMsg = (err as BusinessError).message || JSON.stringify(err);
-      console.error('解压失败详情:', errMsg, err);
       showToast('解压失败: ' + errMsg);
+      console.error('解压失败详情', errMsg);
     } finally {
       this.isLoading = false;
       this.selectedIndices.clear();
       this.isSelectionMode = false;
-      console.info('解压操作结束，清理状态');
     }
   }
 
@@ -365,12 +325,6 @@ struct FileBrowser {
    */
   async importFiles(): Promise<void> {
     try {
-      // 检查picker API是否可用
-      if (!canIUse('SystemCapability.FileManagement.UserFileService')) {
-        showToast('当前设备不支持文件选择功能');
-        return;
-      }
-      
       // 创建文件选择器
       const documentPicker = new picker.DocumentViewPicker();
       const result = await documentPicker.select({
@@ -410,6 +364,8 @@ struct FileBrowser {
     try {
       // 打开源文件（只读）
       const srcFile = fileIo.openSync(uri, fileIo.OpenMode.READ_ONLY);
+      // 获取文件名
+      const stat = fileIo.statSync(srcFile.fd);
       // 从 URI 中提取文件名
       const uriParts = uri.split('/');
       const fileName = uriParts[uriParts.length - 1];
@@ -425,108 +381,6 @@ struct FileBrowser {
         fileIo.writeSync(destFile.fd, writeBuf);
         bytesRead = fileIo.readSync(srcFile.fd, buf);
       }
-      // 关闭文件
-      fileIo.closeSync(srcFile.fd);
-      fileIo.closeSync(destFile.fd);
-    } catch (err) {
-      console.error('复制文件失败', JSON.stringify(err));
-      throw new Error('复制文件失败: ' + JSON.stringify(err));
-    }
-  }
-
-  // ---------- 导出功能 ----------
-
-  /**
-   * 打开文件保存对话框，将选中的文件导出到用户选择的位置
-   */
-  async exportFiles(): Promise<void> {
-    try {
-      // 检查是否有选中的文件
-      const selectedPaths = this.getSelectedPaths();
-      if (selectedPaths.length === 0) {
-        showToast('请先选择要导出的文件或文件夹');
-        return;
-      }
-
-      // 检查picker API是否可用
-      if (!canIUse('SystemCapability.FileManagement.UserFileService')) {
-        showToast('当前设备不支持文件保存功能');
-        return;
-      }
-      
-      // 创建文件保存对话框
-      const documentPicker = new picker.DocumentViewPicker();
-      
-      // 逐个处理选中的文件
-      let successCount = 0;
-      for (const sourcePath of selectedPaths) {
-        try {
-          // 获取文件名
-          const fileName = sourcePath.split('/').pop() || 'file';
-          
-          // 创建保存选项
-          const documentSaveOptions = new picker.DocumentSaveOptions();
-          documentSaveOptions.newFileNames = [fileName];
-          
-          // 打开保存对话框，让用户选择保存位置
-          const result = await documentPicker.save(documentSaveOptions);
-          
-          if (!result || result.length === 0) {
-            // 用户取消保存当前文件，继续处理下一个
-            continue;
-          }
-          
-          // 获取保存的URI
-          const destUri = result[0];
-          
-          // 复制文件到用户选择的位置
-          await this.copyFileToPublicDir(sourcePath, destUri);
-          successCount++;
-        } catch (err) {
-          console.error('导出文件失败: ' + sourcePath, JSON.stringify(err));
-        }
-      }
-      
-      if (successCount > 0) {
-        showToast('成功导出 ' + successCount + ' 个文件');
-      } else {
-        showToast('未导出任何文件');
-      }
-      
-      // 刷新文件列表
-      this.refresh();
-    } catch (err) {
-      const bizErr = err as BusinessError;
-      if (bizErr.code === 0) {
-        // 用户取消选择，不提示
-        return;
-      }
-      showToast('导出失败: ' + bizErr.message);
-      console.error('导出文件失败', JSON.stringify(err));
-    }
-  }
-
-  /**
-   * 将文件从沙箱复制到用户选择的公共目录
-   */
-  async copyFileToPublicDir(sourcePath: string, destUri: string): Promise<void> {
-    try {
-      // 打开源文件（只读）
-      const srcFile = fileIo.openSync(sourcePath, fileIo.OpenMode.READ_ONLY);
-      
-      // 打开目标文件（读写，若存在则覆盖）
-      const destFile = fileIo.openSync(destUri, fileIo.OpenMode.CREATE | fileIo.OpenMode.WRITE_ONLY);
-      
-      // 复制文件内容
-      const bufSize = 1024 * 1024; // 1MB 缓冲区
-      const buf = new ArrayBuffer(bufSize);
-      let bytesRead = fileIo.readSync(srcFile.fd, buf);
-      while (bytesRead > 0) {
-        const writeBuf = buf.slice(0, bytesRead);
-        fileIo.writeSync(destFile.fd, writeBuf);
-        bytesRead = fileIo.readSync(srcFile.fd, buf);
-      }
-      
       // 关闭文件
       fileIo.closeSync(srcFile.fd);
       fileIo.closeSync(destFile.fd);
@@ -699,18 +553,6 @@ struct FileBrowser {
           .fontSize(14)
           .height(36)
         Blank()
-        Button('导出')
-          .onClick((): void => {
-            try {
-              this.exportFiles();
-            } catch (err) {
-              console.error('导出失败', JSON.stringify(err));
-              showToast('导出失败');
-            }
-          })
-          .fontSize(14)
-          .height(36)
-        Blank()
         Button('删除')
           .onClick((): void => {
             try {
@@ -738,18 +580,6 @@ struct FileBrowser {
             } catch (err) {
               console.error('导入失败', JSON.stringify(err));
               showToast('导入失败');
-            }
-          })
-          .fontSize(14)
-          .height(36)
-        Blank()
-        Button('导出')
-          .onClick((): void => {
-            try {
-              this.exportFiles();
-            } catch (err) {
-              console.error('导出失败', JSON.stringify(err));
-              showToast('导出失败');
             }
           })
           .fontSize(14)
@@ -849,16 +679,14 @@ struct CompressDialog {
           .onClick((): void => { this.controller?.close(); })
           .margin(8)
         Button('开始压缩')
-          .onClick(async (): Promise<void> => {
+          .onClick((): void => {
             this.controller?.close();
             // 使用可选链调用 onConfirm
-            if (this.onConfirm) {
-              await this.onConfirm({
-                format: this.formats[this.selectedIndex],
-                password: this.password || undefined,
-                splitSize: this.splitSize || undefined
-              });
-            }
+            this.onConfirm?.({
+              format: this.formats[this.selectedIndex],
+              password: this.password || undefined,
+              splitSize: this.splitSize || undefined
+            });
           })
           .margin(8)
       }
@@ -876,7 +704,7 @@ struct ExtractDialog {
   controller?: CustomDialogController;
   @Prop archivePath: string = '';
   @Prop sandboxRoot: string = '';
-  onConfirm?: (destPath: string, password?: string) => Promise<void>;
+  onConfirm?: (destPath: string, password?: string) => void;
 
   @State destPath: string = '';
   @State password: string = '';
@@ -886,27 +714,9 @@ struct ExtractDialog {
 
   aboutToAppear(): void {
     // 根据 archivePath 自动生成默认解压路径
-    console.info('ExtractDialog.aboutToAppear: archivePath =', this.archivePath);
-    
-    if (!this.archivePath) {
-      console.warn('archivePath 为空，使用沙箱根目录');
-      this.destPath = this.sandboxRoot;
-      return;
-    }
-    
-    const lastSlashIndex = this.archivePath.lastIndexOf('/');
-    if (lastSlashIndex === -1) {
-      console.warn('archivePath 不包含路径分隔符:', this.archivePath);
-      this.destPath = this.sandboxRoot + '/' + this.archivePath.replace(/\.[^/.]+$/, '');
-      return;
-    }
-    
-    const baseName = this.archivePath.substring(lastSlashIndex + 1);
-    const dirName = baseName.replace(/\.[^/.]+$/, '') || 'extracted';
-    const parentDir = this.archivePath.substring(0, lastSlashIndex + 1);
-    
-    this.destPath = parentDir + dirName;
-    console.info('生成的解压路径:', this.destPath);
+    const baseName = this.archivePath.substring(this.archivePath.lastIndexOf('/') + 1);
+    const dirName = baseName.replace(/\.[^/.]+$/, '');
+    this.destPath = this.archivePath.substring(0, this.archivePath.lastIndexOf('/') + 1) + dirName;
   }
 
   /**
@@ -1038,7 +848,6 @@ struct ExtractDialog {
           }
           .layoutWeight(1)
           .width('100%')
-          .height('100%')
 
           // 按钮行
           Row() {
@@ -1104,31 +913,9 @@ struct ExtractDialog {
             })
             .margin(8)
           Button('开始解压')
-            .onClick(async (): Promise<void> => {
-              // 验证目标路径
-              if (!this.destPath || this.destPath.trim() === '') {
-                showToast('请选择或输入有效的目标路径');
-                return;
-              }
-              
-              // 清理路径：移除开头和结尾的空格，确保以沙箱根目录开头
-              let cleanPath = this.destPath.trim();
-              if (!cleanPath.startsWith(this.sandboxRoot)) {
-                // 如果不是绝对路径，则相对于沙箱根目录
-                if (cleanPath.startsWith('/')) {
-                  // 已经是绝对路径，但不在沙箱内
-                  showToast('目标路径必须在应用沙箱内');
-                  return;
-                } else {
-                  // 相对路径，转换为绝对路径
-                  cleanPath = this.sandboxRoot + '/' + cleanPath;
-                }
-              }
-              
+            .onClick((): void => {
               this.controller?.close();
-              if (this.onConfirm) {
-                await this.onConfirm(cleanPath, this.password || undefined);
-              }
+              this.onConfirm?.(this.destPath, this.password || undefined);
             })
             .margin(8)
         }
@@ -1138,61 +925,6 @@ struct ExtractDialog {
     .padding(16)
     .width('90%')
     .height(this.showDirPicker ? '80%' : 'auto')
-    .backgroundColor('#fff')
-    .borderRadius(16)
-  }
-}
-
-// 删除确认对话框组件
-@CustomDialog
-struct DeleteConfirmDialog {
-  controller?: CustomDialogController;
-  @Prop message: string = '';
-  onConfirm?: () => Promise<void>;
-
-  build() {
-    Column() {
-      Text('确认删除')
-        .fontSize(20)
-        .fontWeight(FontWeight.Bold)
-        .margin({ top: 16, bottom: 16 })
-
-      Text(this.message)
-        .fontSize(14)
-        .textAlign(TextAlign.Start)
-        .padding({ left: 16, right: 16, bottom: 24 })
-        .width('100%')
-
-      Row() {
-        Button('取消')
-          .onClick((): void => {
-            this.controller?.close();
-          })
-          .backgroundColor('#f0f0f0')
-          .fontColor(Color.Black)
-          .margin(8)
-          .width(100)
-          .height(40)
-
-        Button('确认删除')
-          .onClick(async (): Promise<void> => {
-            this.controller?.close();
-            if (this.onConfirm) {
-              await this.onConfirm();
-            }
-          })
-          .backgroundColor('#ff4d4f')
-          .fontColor(Color.White)
-          .margin(8)
-          .width(100)
-          .height(40)
-      }
-      .justifyContent(FlexAlign.Center)
-      .width('100%')
-      .margin({ bottom: 16 })
-    }
-    .padding(16)
-    .width('80%')
     .backgroundColor('#fff')
     .borderRadius(16)
   }
