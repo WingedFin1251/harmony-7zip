@@ -17,8 +17,8 @@ export interface CompressOptions {
 
 // 解压选项接口
 export interface ExtractOptions {
-  destPath: string;
   password?: string;
+  extractPath?: string;
 }
 
 // 颜色资源类型
@@ -90,3 +90,16 @@ export const ColorResource: ColorResourceType = {
   list_item_background: $r('app.color.list_item_background'),
   list_item_selected: $r('app.color.list_item_selected')
 };
+
+// 验证结果接口
+export interface ValidationResult {
+  isValid: boolean;
+  error?: string;
+}
+
+// 支持的压缩格式接口
+export interface SupportedFormat {
+  value: string;
+  label: string;
+  description: string;
+}
