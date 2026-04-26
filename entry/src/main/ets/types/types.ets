@@ -1,17 +1,28 @@
-// FileGridCell.ets
-import { FileItem } from '../models/FileItem';
-import { getFileTypeInfo } from '../utils/FileTypeUtil';
+// 文件项数据类型
+export interface FileItem {
+  name: string;
+  path: string;
+  isDir: boolean;
+  size: number;
+  modified: number;
+  uri?: string;
+}
 
-const DEFAULT_FILE_ITEM: FileItem = {
-  name: '',
-  path: '',
-  isDir: false,
-  size: 0,
-  modified: 0
-};
+// 压缩选项接口
+export interface CompressOptions {
+  format: '7z' | 'zip' | 'tar';
+  password?: string;
+  splitSize?: string;
+}
+
+// 解压选项接口
+export interface ExtractOptions {
+  password?: string;
+  extractPath?: string;
+}
 
 // 颜色资源类型
-interface ColorResourceType {
+export interface ColorResourceType {
   background_primary: Resource;
   background_secondary: Resource;
   background_tertiary: Resource;
@@ -46,7 +57,7 @@ interface ColorResourceType {
 }
 
 // 颜色资源常量
-const ColorResource: ColorResourceType = {
+export const ColorResource: ColorResourceType = {
   background_primary: $r('app.color.background_primary'),
   background_secondary: $r('app.color.background_secondary'),
   background_tertiary: $r('app.color.background_tertiary'),
@@ -80,57 +91,15 @@ const ColorResource: ColorResourceType = {
   list_item_selected: $r('app.color.list_item_selected')
 };
 
-@Component
-export struct FileGridCell {   // 关键：将 FileRow 改为 FileGridCell
-  @Prop item: FileItem = DEFAULT_FILE_ITEM;
-  @Prop selected: boolean = false;
-  @Prop isSelectionMode: boolean = false;
-  onSelect?: (selected: boolean) => void;
-  onOpen?: () => void;
+// 验证结果接口
+export interface ValidationResult {
+  isValid: boolean;
+  error?: string;
+}
 
-  build() {
-    Column() {
-      Image(getFileTypeInfo(this.item.name, this.item.isDir).icon)
-        .width(48)
-        .height(48)
-        .margin(8)
-      Text(this.item.name)
-        .fontSize(14)
-        .maxLines(1)
-        .textOverflow({ overflow: TextOverflow.Ellipsis })
-        .width('100%')
-        .textAlign(TextAlign.Center)
-      if (!this.item.isDir) {
-        Text(this.formatSize(this.item.size))
-          .fontSize(10)
-          .fontColor(ColorResource.text_tertiary)
-      }
-    }
-    .width('100%')
-    .aspectRatio(1.0)
-    .justifyContent(FlexAlign.Center)
-    .backgroundColor(this.selected ? ColorResource.background_selected : ColorResource.card_background)
-    .borderRadius(8)
-    .onClick((): void => {
-      if (this.isSelectionMode) {
-        this.onSelect?.(!this.selected);
-      } else {
-        this.onOpen?.();
-      }
-    })
-    .gesture(
-      LongPressGesture()
-        .onAction((): void => {
-          if (!this.isSelectionMode) {
-            this.onSelect?.(true);
-          }
-        })
-    )
-  }
-
-  formatSize(size: number): string {
-    if (size < 1024) return size + ' B';
-    if (size < 1024 * 1024) return (size / 1024).toFixed(1) + ' KB';
-    return (size / (1024 * 1024)).toFixed(1) + ' MB';
-  }
+// 支持的压缩格式接口
+export interface SupportedFormat {
+  value: string;
+  label: string;
+  description: string;
 }

@@ -3,6 +3,130 @@
     {
       "name": "start_window_background",
       "value": "#FFFFFF"
+    },
+    {
+      "name": "background_primary",
+      "value": "#FFFFFF"
+    },
+    {
+      "name": "background_secondary",
+      "value": "#F5F5F5"
+    },
+    {
+      "name": "background_tertiary",
+      "value": "#FAFAFA"
+    },
+    {
+      "name": "background_selected",
+      "value": "#E0F0FF"
+    },
+    {
+      "name": "text_primary",
+      "value": "#000000"
+    },
+    {
+      "name": "text_secondary",
+      "value": "#666666"
+    },
+    {
+      "name": "text_tertiary",
+      "value": "#999999"
+    },
+    {
+      "name": "text_disabled",
+      "value": "#CCCCCC"
+    },
+    {
+      "name": "text_inverse",
+      "value": "#FFFFFF"
+    },
+    {
+      "name": "border_primary",
+      "value": "#E0E0E0"
+    },
+    {
+      "name": "border_secondary",
+      "value": "#F0F0F0"
+    },
+    {
+      "name": "accent_primary",
+      "value": "#007AFF"
+    },
+    {
+      "name": "accent_secondary",
+      "value": "#0056CC"
+    },
+    {
+      "name": "accent_tertiary",
+      "value": "#E6F2FF"
+    },
+    {
+      "name": "status_success",
+      "value": "#34C759"
+    },
+    {
+      "name": "status_warning",
+      "value": "#FF9500"
+    },
+    {
+      "name": "status_error",
+      "value": "#FF3B30"
+    },
+    {
+      "name": "status_info",
+      "value": "#007AFF"
+    },
+    {
+      "name": "icon_primary",
+      "value": "#000000"
+    },
+    {
+      "name": "icon_secondary",
+      "value": "#666666"
+    },
+    {
+      "name": "icon_disabled",
+      "value": "#CCCCCC"
+    },
+    {
+      "name": "button_primary_background",
+      "value": "#007AFF"
+    },
+    {
+      "name": "button_primary_text",
+      "value": "#FFFFFF"
+    },
+    {
+      "name": "button_secondary_background",
+      "value": "#F0F0F0"
+    },
+    {
+      "name": "button_secondary_text",
+      "value": "#000000"
+    },
+    {
+      "name": "button_danger_background",
+      "value": "#FF4D4F"
+    },
+    {
+      "name": "button_danger_text",
+      "value": "#FFFFFF"
+    },
+    {
+      "name": "card_background",
+      "value": "#F8F8F8"
+    },
+    {
+      "name": "dialog_background",
+      "value": "#FFFFFF"
+    },
+    {
+      "name": "list_item_background",
+      "value": "#FFFFFF"
+    },
+    {
+      "name": "list_item_selected",
+      "value": "#E0F0FF"
     }
   ]
 }

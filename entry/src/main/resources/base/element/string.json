@@ -19,6 +19,10 @@
     {
       "name": "write_storage_permission_reason",
       "value": "用于将文件导出到用户存储"
+    },
+    {
+      "name": "file_access_permission_reason",
+      "value": "用于访问文件管理器导入文件"
     }
   ]
 }

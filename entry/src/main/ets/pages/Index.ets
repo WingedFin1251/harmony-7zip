@@ -1,87 +1,152 @@
 import { BusinessError } from '@kit.BasicServicesKit';
-import { picker } from '@kit.CoreFileKit';
-import { fileIo } from '@kit.CoreFileKit';
-import * as native from 'libentry.so';
-import { showToast } from '../utils/ToastUtil';
+import { ToastUtil } from '../utils/ToastUtil';
 import { FileRow } from '../components/FileRow';
 import { FileGridCell } from '../components/FileGridCell';
+import { isArchiveFile } from '../utils/FileTypeUtil';
+import { common } from '@kit.AbilityKit';
+
+// 导入拆分后的模块
+import { FileItem, ColorResource, CompressOptions, ExtractOptions } from '../types/types';
+import { FileManager } from '../managers/FileManager';
+import { ArchiveManager } from '../managers/ArchiveManager';
+import { CompressDialog, ExtractDialog, DeleteConfirmDialog } from '../components/UiComponents';
 
 
-// 临时定义权限类型（如果从 SDK 导入失败）
 
-// 文件项数据类型
-interface FileItem {
-  name: string;
-  path: string;
-  isDir: boolean;
-  size: number;
-  modified: number;
-  uri?: string;
-}
 
-// 压缩选项接口
-interface CompressOptions {
-  format: '7z' | 'zip' | 'tar';
-  password?: string;
-  splitSize?: string;
-}
 
 @Entry
 @Component
 struct FileBrowser {
-  // ---------- 状态变量 ----------
-  @State currentPath: string = '';
+  // 状态变量
   @State files: FileItem[] = [];
+  @State currentPath: string = '';
   @State selectedIndices: Set<number> = new Set();
   @State isSelectionMode: boolean = false;
   @State viewMode: 'list' | 'grid' = 'list';
   @State isLoading: boolean = false;
   @State searchKeyword: string = '';
 
+  // 管理器实例
+  private fileManager: FileManager | null = null;
+  private archiveManager: ArchiveManager | null = null;
+
+  // 对话框控制器
   compressDialogController: CustomDialogController | null = null;
   extractDialogController: CustomDialogController | null = null;
   deleteDialogController: CustomDialogController | null = null;
 
   aboutToAppear(): void {
-    // 获取应用沙箱根目录
-    this.currentPath = getContext(this).filesDir;
-    this.loadFiles();
+    try {
+      // 先尝试获取 UIContext 并设置
+      const uiContext = this.getUIContext();
+      if (uiContext) {
+        ToastUtil.setUIContext(uiContext);
+      } else {
+        console.warn('无法获取 UIContext，Toast 功能可能受限');
+      }
+
+      // 获取 UIAbilityContext
+      const context = getContext(this) as common.UIAbilityContext;
+      if (context && context.filesDir) {
+        this.currentPath = context.filesDir;
+        console.log('当前路径设置为:', this.currentPath);
+
+        this.fileManager = new FileManager(this.currentPath, context);
+        this.archiveManager = new ArchiveManager();
+
+        this.loadFiles();
+      } else {
+        console.error('获取上下文失败，无法初始化管理器');
+        ToastUtil.showToast('初始化失败: 无法获取应用上下文');
+        // 后备方案：仅使用沙箱路径，不传 context（导入导出功能会受限）
+        this.currentPath = '/data/storage/el2/base/files';
+        this.fileManager = new FileManager(this.currentPath);
+        this.archiveManager = new ArchiveManager();
+        this.loadFiles();
+      }
+    } catch (err) {
+      console.error('aboutToAppear初始化失败:', err);
+      ToastUtil.showToast('应用初始化失败: ' + (err as Error).message);
+      // 最终回退
+      try {
+        this.currentPath = '/data/storage/el2/base/files';
+        this.fileManager = new FileManager(this.currentPath);
+        this.archiveManager = new ArchiveManager();
+        this.loadFiles();
+      } catch (fallbackErr) {
+        console.error('回退初始化也失败:', fallbackErr);
+      }
+    }
   }
 
   getSandboxRoot(): string {
-    return getContext(this).filesDir;
+    try {
+      const uicontext = this.getUIContext();
+      if (!uicontext) {
+        console.error('getSandboxRoot: 无法获取UIContext');
+        return '/data/storage/el2/base/files';
+      }
+
+      const context = uicontext.getHostContext();
+      if (context && context.filesDir) {
+        return context.filesDir;
+      } else {
+        console.warn('getSandboxRoot: 无法获取filesDir，使用默认路径');
+        return '/data/storage/el2/base/files';
+      }
+    } catch (err) {
+      console.error('getSandboxRoot异常:', JSON.stringify(err));
+      return '/data/storage/el2/base/files';
+    }
+  }
+
+  // 辅助方法：安全访问 fileManager
+  private getFileManager(): FileManager {
+    if (!this.fileManager) {
+      throw new Error('FileManager 未初始化');
+    }
+    return this.fileManager;
+  }
+
+  // 确保FileManager有context，如果没有则尝试获取
+  private ensureFileManagerHasContext(): boolean {
+    const fileManager = this.getFileManager();
+    if (fileManager.hasContext()) {
+      return true;
+    }
+    
+    try {
+      // 尝试获取UIAbilityContext
+      const context = getContext(this) as common.UIAbilityContext;
+      if (context) {
+        fileManager.setContext(context);
+        console.log('FileManager context 已设置');
+        return true;
+      }
+    } catch (err) {
+      console.error('获取UIAbilityContext失败:', err);
+    }
+    
+    return false;
+  }
+
+  // 辅助方法：安全访问 archiveManager
+  private getArchiveManager(): ArchiveManager {
+    if (!this.archiveManager) {
+      throw new Error('ArchiveManager 未初始化');
+    }
+    return this.archiveManager;
   }
 
   async loadFiles(): Promise<void> {
     this.isLoading = true;
     try {
-      // 使用 fileIo 读取沙箱目录下的真实文件列表
-      const fileNames: string[] = fileIo.listFileSync(this.currentPath);
-      const fileItems: FileItem[] = [];
-      for (const name of fileNames) {
-        const fullPath = this.currentPath + '/' + name;
-        try {
-          const stat = fileIo.statSync(fullPath);
-          fileItems.push({
-            name: name,
-            path: fullPath,
-            isDir: stat.isDirectory(),
-            size: stat.size,
-            modified: stat.mtime
-          });
-        } catch (statErr) {
-          // 如果某个文件无法 stat，跳过
-          console.error('stat 失败: ' + fullPath, JSON.stringify(statErr));
-        }
-      }
-      // 按文件夹优先、名称排序
-      fileItems.sort((a, b) => {
-        if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
-        return a.name.localeCompare(b.name);
-      });
-      this.files = fileItems;
+      const fileManager = this.getFileManager();
+      await fileManager.loadFiles();
+      this.files = fileManager.getFiles();
     } catch (err) {
-      showToast('加载失败: ' + (err as BusinessError).message);
+      ToastUtil.showToast('加载失败: ' + (err as BusinessError).message);
       console.error('加载文件列表失败', JSON.stringify(err));
     } finally {
       this.isLoading = false;
@@ -93,52 +158,87 @@ struct FileBrowser {
   }
 
   goBack(): void {
-    const sandboxRoot = this.getSandboxRoot();
-    if (this.currentPath === sandboxRoot) {
-      showToast('已在沙箱根目录');
-      return;
+    try {
+      const sandboxRoot = this.getSandboxRoot();
+      if (!sandboxRoot || sandboxRoot === '') {
+        ToastUtil.showToast('无法获取沙箱根目录');
+        return;
+      }
+
+      if (this.currentPath === sandboxRoot) {
+        ToastUtil.showToast('已在沙箱根目录');
+        return;
+      }
+
+      if (!this.currentPath || this.currentPath === '') {
+        this.currentPath = sandboxRoot;
+        this.refresh();
+        return;
+      }
+
+      const parts = this.currentPath.split('/').filter(part => part.trim() !== '');
+      if (parts.length <= 1) {
+        this.currentPath = sandboxRoot;
+      } else {
+        parts.pop();
+        this.currentPath = parts.join('/');
+        // 确保路径不以斜杠开头
+        if (this.currentPath.startsWith('/')) {
+          this.currentPath = this.currentPath.substring(1);
+        }
+      }
+
+      // 更新FileManager的当前路径
+      if (this.fileManager) {
+        this.fileManager.setCurrentPath(this.currentPath);
+      }
+
+      this.refresh();
+    } catch (err) {
+      console.error('返回操作失败:', JSON.stringify(err));
+      ToastUtil.showToast('返回失败: ' + (err as Error).message);
     }
-    const parts = this.currentPath.split('/');
-    parts.pop();
-    this.currentPath = parts.join('/') || sandboxRoot;
-    this.refresh();
   }
 
   toggleSelect(index: number, selected: boolean): void {
-    if (selected) {
-      this.selectedIndices.add(index);
-    } else {
-      this.selectedIndices.delete(index);
-    }
+    const fileManager = this.getFileManager();
+    fileManager.toggleSelect(index, selected);
+    this.selectedIndices = fileManager.getSelectedIndices();
     this.isSelectionMode = this.selectedIndices.size > 0;
   }
 
   toggleSelectAll(): void {
-    if (this.selectedIndices.size === this.files.length) {
-      this.selectedIndices.clear();
-    } else {
-      this.selectedIndices = new Set(this.files.keys());
-    }
+    const fileManager = this.getFileManager();
+    fileManager.toggleSelectAll();
+    this.selectedIndices = fileManager.getSelectedIndices();
     this.isSelectionMode = this.selectedIndices.size > 0;
   }
 
   getSelectedPaths(): string[] {
-    return Array.from(this.selectedIndices).map(i => this.files[i].path);
+    const fileManager = this.getFileManager();
+    return fileManager.getSelectedPaths();
   }
 
   openFolder(item: FileItem): void {
-    if (item.isDir) {
-      this.currentPath = item.path;
-      this.selectedIndices.clear();
-      this.isSelectionMode = false;
-      this.refresh();
-    }
+    const fileManager = this.getFileManager();
+    fileManager.openFolder(item);
+    this.currentPath = fileManager.getCurrentPath();
+    this.selectedIndices.clear();
+    this.isSelectionMode = false;
+    this.refresh();
+  }
+
+  async openFile(item: FileItem): Promise<void> {
+    const fileManager = this.getFileManager();
+    await fileManager.openFile(item);
+    this.selectedIndices = fileManager.getSelectedIndices();
+    this.isSelectionMode = this.selectedIndices.size > 0;
   }
 
   showCompressDialog(): void {
     if (this.selectedIndices.size === 0) {
       try {
-        showToast('请先选择文件或文件夹');
+        ToastUtil.showToast('请先选择文件或文件夹');
       } catch (err) {
         console.error('显示提示失败', JSON.stringify(err));
       }
@@ -157,1043 +257,400 @@ struct FileBrowser {
   async startCompress(options: CompressOptions): Promise<void> {
     this.isLoading = true;
     try {
-      await native.compress(
-        this.getSelectedPaths(),
-        this.currentPath + '/archive.' + options.format,
-        options
-      );
-      showToast('压缩成功');
-      this.refresh();
-    } catch (err) {
-      showToast('压缩失败: ' + (err as BusinessError).message);
-    } finally {
-      this.isLoading = false;
+      const archiveManager = this.getArchiveManager();
+      await archiveManager.startCompress(this.getSelectedPaths(), this.currentPath, options);
       this.selectedIndices.clear();
       this.isSelectionMode = false;
+      this.refresh();
+    } catch (err) {
+      console.error('压缩失败', JSON.stringify(err));
+    } finally {
+      this.isLoading = false;
     }
   }
 
   showExtractDialog(): void {
-    if (this.selectedIndices.size === 0) {
-      try {
-        showToast('请先选择一个压缩文件');
-      } catch (err) {
-        console.error('显示提示失败', JSON.stringify(err));
-      }
-      return;
-    }
-    const first = this.files[Array.from(this.selectedIndices)[0]];
-    if (first.isDir) {
-      try {
-        showToast('请选择一个压缩文件，而不是文件夹');
-      } catch (err) {
-        console.error('显示提示失败', JSON.stringify(err));
-      }
+    const selectedPaths = this.getSelectedPaths();
+    if (selectedPaths.length !== 1) {
+      ToastUtil.showToast('请选择一个压缩包');
       return;
     }
     this.extractDialogController = new CustomDialogController({
       builder: ExtractDialog({
-        archivePath: first.path,
+        archivePath: selectedPaths[0],
         sandboxRoot: this.getSandboxRoot(),
-        onConfirm: async (destPath: string, password?: string): Promise<void> => {
-          await this.startExtract(first.path, destPath, password);
-        }
+        onConfirm: (destPath: string, password?: string): Promise<void> => this.startExtract(destPath, password)
       }),
       cancel: (): void => { this.extractDialogController?.close(); }
     });
     this.extractDialogController.open();
   }
 
-  async startExtract(archivePath: string, destPath: string, password?: string): Promise<void> {
+  async startExtract(destPath: string, password?: string): Promise<void> {
     this.isLoading = true;
     try {
-      console.info('开始解压操作:', { archivePath, destPath, password });
-      
-      // 0. 验证路径
-      if (!archivePath || !destPath) {
-        showToast('解压失败: 路径不能为空');
-        return;
-      }
-      
-      // 确保目标路径在沙箱内
-      const sandboxRoot = this.getSandboxRoot();
-      if (!destPath.startsWith(sandboxRoot)) {
-        console.error('目标路径不在沙箱内:', { destPath, sandboxRoot });
-        showToast('解压失败: 目标路径必须在应用沙箱内');
-        return;
-      }
-
-      // 1. 检查压缩文件是否存在
-      try {
-        const stat = fileIo.statSync(archivePath);
-        console.info('压缩文件状态:', { path: archivePath, isFile: stat.isFile(), isDirectory: stat.isDirectory() });
-        
-        if (!stat.isFile()) {
-          showToast('解压失败: 选择的不是文件');
-          return;
-        }
-      } catch (statErr) {
-        console.error('压缩文件不存在: ' + archivePath, JSON.stringify(statErr));
-        showToast('解压失败: 压缩文件不存在');
-        return;
-      }
-
-      // 2. 确保目标目录存在（如果不存在则创建）
-      console.info('创建目标目录:', destPath);
-      try {
-        // 先检查目标路径是否已经是文件
-        try {
-          const destStat = fileIo.statSync(destPath);
-          if (destStat.isFile()) {
-            showToast('解压失败: 目标路径是文件，不是目录');
-            return;
-          }
-        } catch (e) {
-          // 路径不存在，继续创建
-        }
-        
-        fileIo.mkdirSync(destPath, true); // recursive = true
-        console.info('目录创建成功或已存在:', destPath);
-      } catch (mkdirErr) {
-        console.error('创建目录失败:', destPath, JSON.stringify(mkdirErr));
-        showToast('解压失败: 无法创建目标目录');
-        return;
-      }
-
-      // 3. 执行解压
-      console.info('调用原生解压接口...');
-      await native.extract(archivePath, destPath, password);
-      console.info('解压操作完成');
-      showToast('解压成功');
-      
-      // 4. 刷新文件列表
-      this.refresh();
-    } catch (err) {
-      const errMsg = (err as BusinessError).message || JSON.stringify(err);
-      console.error('解压失败详情:', errMsg, err);
-      showToast('解压失败: ' + errMsg);
-    } finally {
-      this.isLoading = false;
+      const archiveManager = this.getArchiveManager();
+      const options: ExtractOptions = {
+        password: password,
+        extractPath: destPath
+      };
+      await archiveManager.startExtract(this.getSelectedPaths(), this.currentPath, options);
       this.selectedIndices.clear();
       this.isSelectionMode = false;
-      console.info('解压操作结束，清理状态');
+      this.refresh();
+    } catch (err) {
+      console.error('解压失败', JSON.stringify(err));
+    } finally {
+      this.isLoading = false;
     }
   }
 
   showDeleteConfirmDialog(): void {
-    const paths = this.getSelectedPaths();
-    if (paths.length === 0) {
-      showToast('请先选择要删除的文件或文件夹');
+    const selectedPaths = this.getSelectedPaths();
+    if (selectedPaths.length === 0) {
+      ToastUtil.showToast('请先选择要删除的文件或文件夹');
       return;
     }
-    
-    // 构建确认消息
-    let message = `确定要删除 ${paths.length} 个文件/文件夹吗？\n\n`;
-    const maxShow = 5; // 最多显示5个文件名
-    for (let i = 0; i < Math.min(paths.length, maxShow); i++) {
-      const fileName = paths[i].split('/').pop() || paths[i];
-      message += `• ${fileName}\n`;
-    }
-    if (paths.length > maxShow) {
-      message += `• ... 等 ${paths.length - maxShow} 个文件\n`;
-    }
-    message += '\n此操作不可撤销！';
-    
     this.deleteDialogController = new CustomDialogController({
       builder: DeleteConfirmDialog({
-        message: message,
-        onConfirm: (): Promise<void> => this.deleteSelected()
+        message: `确定要删除选中的 ${selectedPaths.length} 个文件/文件夹吗？`,
+        onConfirm: (): Promise<void> => this.deleteSelectedFiles()
       }),
-      cancel: () => {
-        console.log('用户取消了删除操作');
-      },
-      autoCancel: true,
-      alignment: DialogAlignment.Center,
-      customStyle: true
+      cancel: (): void => { this.deleteDialogController?.close(); }
     });
-    
     this.deleteDialogController.open();
   }
 
-  async deleteSelected(): Promise<void> {
-    const paths = this.getSelectedPaths();
-    if (paths.length === 0) {
-      showToast('请先选择要删除的文件或文件夹');
+  async deleteSelectedFiles(): Promise<void> {
+    const fileManager = this.getFileManager();
+    await fileManager.deleteSelectedFiles();
+    this.selectedIndices = fileManager.getSelectedIndices();
+    this.files = fileManager.getFiles();
+    this.isSelectionMode = false;
+  }
+
+  async importFiles(): Promise<void> {
+    if (!this.ensureFileManagerHasContext()) {
+      ToastUtil.showToast('导入失败: 应用上下文未初始化');
       return;
     }
-
-    let successCount = 0;
-    let failCount = 0;
     
-    for (const path of paths) {
-      try {
-        // 获取文件信息以判断是文件还是目录
-        const stat = fileIo.statSync(path);
-        if (stat.isDirectory()) {
-          // 删除目录
-          fileIo.rmdirSync(path);
-        } else {
-          // 删除文件
-          fileIo.unlinkSync(path);
-        }
-        successCount++;
-      } catch (err) {
-        console.error('删除失败: ' + path, JSON.stringify(err));
-        failCount++;
-      }
-    }
-    
-    if (successCount > 0) {
-      if (failCount === 0) {
-        showToast(`成功删除 ${successCount} 个文件/文件夹`);
-      } else {
-        showToast(`成功删除 ${successCount} 个，失败 ${failCount} 个`);
-      }
-    } else {
-      showToast('删除失败，请检查文件权限');
-    }
-    
-    this.selectedIndices.clear();
-    this.isSelectionMode = false;
-    this.refresh();
+    const fileManager = this.getFileManager();
+    await fileManager.importFiles();
+    this.files = fileManager.getFiles();
   }
 
-  // ---------- 导入功能 ----------
-
-  /**
-   * 打开文件选择器，选择文件导入到当前目录
-   */
-  async importFiles(): Promise<void> {
-    try {
-      // 检查picker API是否可用
-      if (!canIUse('SystemCapability.FileManagement.UserFileService')) {
-        showToast('当前设备不支持文件选择功能');
-        return;
-      }
-      
-      // 创建文件选择器
-      const documentPicker = new picker.DocumentViewPicker();
-      const result = await documentPicker.select({
-        maxSelectNumber: 10 // 最多选择10个文件
-      });
-      if (!result || result.length === 0) {
-        return;
-      }
-      showToast('正在导入 ' + result.length + ' 个文件...');
-      // 逐个复制文件到当前目录
-      let successCount = 0;
-      for (const uri of result) {
-        try {
-          await this.copyFileToCurrentDir(uri);
-          successCount++;
-        } catch (err) {
-          console.error('导入文件失败: ' + uri, JSON.stringify(err));
-        }
-      }
-      showToast('成功导入 ' + successCount + ' 个文件');
-      this.refresh();
-    } catch (err) {
-      const bizErr = err as BusinessError;
-      if (bizErr.code === 0) {
-        // 用户取消选择，不提示
-        return;
-      }
-      showToast('导入失败: ' + bizErr.message);
-      console.error('导入文件失败', JSON.stringify(err));
-    }
-  }
-
-  /**
-   * 将 URI 指向的文件复制到当前目录
-   */
-  async copyFileToCurrentDir(uri: string): Promise<void> {
-    try {
-      // 打开源文件（只读）
-      const srcFile = fileIo.openSync(uri, fileIo.OpenMode.READ_ONLY);
-      // 从 URI 中提取文件名
-      const uriParts = uri.split('/');
-      const fileName = uriParts[uriParts.length - 1];
-      const destPath = this.currentPath + '/' + fileName;
-      // 创建目标文件（读写，若存在则覆盖）
-      const destFile = fileIo.openSync(destPath, fileIo.OpenMode.CREATE | fileIo.OpenMode.WRITE_ONLY);
-      // 复制文件内容
-      const bufSize = 1024 * 1024; // 1MB 缓冲区
-      const buf = new ArrayBuffer(bufSize);
-      let bytesRead = fileIo.readSync(srcFile.fd, buf);
-      while (bytesRead > 0) {
-        const writeBuf = buf.slice(0, bytesRead);
-        fileIo.writeSync(destFile.fd, writeBuf);
-        bytesRead = fileIo.readSync(srcFile.fd, buf);
-      }
-      // 关闭文件
-      fileIo.closeSync(srcFile.fd);
-      fileIo.closeSync(destFile.fd);
-    } catch (err) {
-      console.error('复制文件失败', JSON.stringify(err));
-      throw new Error('复制文件失败: ' + JSON.stringify(err));
-    }
-  }
-
-  // ---------- 导出功能 ----------
-
-  /**
-   * 打开文件保存对话框，将选中的文件导出到用户选择的位置
-   */
   async exportFiles(): Promise<void> {
+    if (!this.ensureFileManagerHasContext()) {
+      ToastUtil.showToast('导出失败: 应用上下文未初始化');
+      return;
+    }
+    
+    const fileManager = this.getFileManager();
+    await fileManager.exportFiles();
+  }
+
+  async openFileWithOtherApp(item: FileItem): Promise<void> {
+    if (!this.ensureFileManagerHasContext()) {
+      ToastUtil.showToast('打开文件失败: 应用上下文未初始化');
+      return;
+    }
+    
     try {
-      // 检查是否有选中的文件
-      const selectedPaths = this.getSelectedPaths();
-      if (selectedPaths.length === 0) {
-        showToast('请先选择要导出的文件或文件夹');
-        return;
-      }
-
-      // 检查picker API是否可用
-      if (!canIUse('SystemCapability.FileManagement.UserFileService')) {
-        showToast('当前设备不支持文件保存功能');
-        return;
-      }
-      
-      // 创建文件保存对话框
-      const documentPicker = new picker.DocumentViewPicker();
-      
-      // 逐个处理选中的文件
-      let successCount = 0;
-      for (const sourcePath of selectedPaths) {
-        try {
-          // 获取文件名
-          const fileName = sourcePath.split('/').pop() || 'file';
-          
-          // 创建保存选项
-          const documentSaveOptions = new picker.DocumentSaveOptions();
-          documentSaveOptions.newFileNames = [fileName];
-          
-          // 打开保存对话框，让用户选择保存位置
-          const result = await documentPicker.save(documentSaveOptions);
-          
-          if (!result || result.length === 0) {
-            // 用户取消保存当前文件，继续处理下一个
-            continue;
-          }
-          
-          // 获取保存的URI
-          const destUri = result[0];
-          
-          // 复制文件到用户选择的位置
-          await this.copyFileToPublicDir(sourcePath, destUri);
-          successCount++;
-        } catch (err) {
-          console.error('导出文件失败: ' + sourcePath, JSON.stringify(err));
-        }
-      }
-      
-      if (successCount > 0) {
-        showToast('成功导出 ' + successCount + ' 个文件');
-      } else {
-        showToast('未导出任何文件');
-      }
-      
-      // 刷新文件列表
-      this.refresh();
+      await this.getFileManager().openWithOtherApp(item.path);
     } catch (err) {
-      const bizErr = err as BusinessError;
-      if (bizErr.code === 0) {
-        // 用户取消选择，不提示
-        return;
-      }
-      showToast('导出失败: ' + bizErr.message);
-      console.error('导出文件失败', JSON.stringify(err));
+      ToastUtil.showToast((err as Error).message);
     }
   }
 
-  /**
-   * 将文件从沙箱复制到用户选择的公共目录
-   */
-  async copyFileToPublicDir(sourcePath: string, destUri: string): Promise<void> {
-    try {
-      // 打开源文件（只读）
-      const srcFile = fileIo.openSync(sourcePath, fileIo.OpenMode.READ_ONLY);
-      
-      // 打开目标文件（读写，若存在则覆盖）
-      const destFile = fileIo.openSync(destUri, fileIo.OpenMode.CREATE | fileIo.OpenMode.WRITE_ONLY);
-      
-      // 复制文件内容
-      const bufSize = 1024 * 1024; // 1MB 缓冲区
-      const buf = new ArrayBuffer(bufSize);
-      let bytesRead = fileIo.readSync(srcFile.fd, buf);
-      while (bytesRead > 0) {
-        const writeBuf = buf.slice(0, bytesRead);
-        fileIo.writeSync(destFile.fd, writeBuf);
-        bytesRead = fileIo.readSync(srcFile.fd, buf);
-      }
-      
-      // 关闭文件
-      fileIo.closeSync(srcFile.fd);
-      fileIo.closeSync(destFile.fd);
-    } catch (err) {
-      console.error('复制文件失败', JSON.stringify(err));
-      throw new Error('复制文件失败: ' + JSON.stringify(err));
+  openArchiveItem(item: FileItem): void {
+    const fileManager = this.getFileManager();
+    // 1. 清除所有选中
+    const currentSelected = Array.from(fileManager.getSelectedIndices());
+    for (const idx of currentSelected) {
+      fileManager.toggleSelect(idx, false);
     }
+    // 2. 选中当前文件
+    const index = this.files.findIndex(f => f.path === item.path);
+    if (index !== -1) {
+      fileManager.toggleSelect(index, true);
+    }
+    // 3. 同步页面状态
+    this.selectedIndices = fileManager.getSelectedIndices();
+    this.isSelectionMode = false; // 可选，退出多选模式
+    // 4. 弹出解压对话框
+    this.showExtractDialog();
   }
 
-  // ---------- UI 构建 ----------
-  build() {
-    Column() {
-      this.TitleBar();
-      this.ActionBar();
 
-      Row() {
-        Button(this.viewMode === 'list' ? '网格视图' : '列表视图')
-          .onClick((): void => {
-            this.viewMode = this.viewMode === 'list' ? 'grid' : 'list';
-          })
-          .fontSize(14)
-          .height(32)
-        Blank()
-        if (this.isSelectionMode) {
-          Button(this.selectedIndices.size === this.files.length ? '取消全选' : '全选')
-            .onClick((): void => this.toggleSelectAll())
-            .fontSize(14)
-            .height(32)
-        }
-      }
-      .padding({ left: 12, right: 12, bottom: 8 })
-      .width('100%')
+  // ---------- UI构建 ----------
 
-      if (this.isLoading) {
-        LoadingProgress().width(100).height(100).margin({ top: 100 })
-      } else if (this.files.length === 0) {
-        Column() {
-          Image($r('app.media.empty_folder'))
-            .width(100)
-            .height(100)
-            .margin(20)
-          Text('此文件夹为空')
-            .fontSize(16)
-            .fontColor('#666')
-        }
-        .width('100%')
-        .layoutWeight(1)
-        .justifyContent(FlexAlign.Center)
-      } else {
-        if (this.viewMode === 'list') {
-          List({ space: 2 }) {
-            ForEach(this.files, (item: FileItem, index: number) => {
-              ListItem() {
-                FileRow({
-                  item: item,
-                  selected: this.selectedIndices.has(index),
-                  isSelectionMode: this.isSelectionMode,
-                  onSelect: (selected: boolean): void => this.toggleSelect(index, selected),
-                  onOpen: (): void => {
-                    if (item.isDir) {
-                      this.openFolder(item);
-                    } else {
-                      if (!this.isSelectionMode) {
-                        this.isSelectionMode = true;
-                        this.selectedIndices.add(index);
-                      }
-                    }
-                  }
-                })
-              }
-            }, (item: FileItem) => item.path)
-          }
-          .width('100%')
-          .height('100%') // 添加高度设置
-          .layoutWeight(1) // 可选，如果希望填充剩余空间
-        } else {
-          Grid() {
-            ForEach(this.files, (item: FileItem, index: number) => {
-              GridItem() {
-                FileGridCell({
-                  item: item,
-                  selected: this.selectedIndices.has(index),
-                  isSelectionMode: this.isSelectionMode,
-                  onSelect: (selected: boolean): void => this.toggleSelect(index, selected),
-                  onOpen: (): void => {
-                    if (item.isDir) {
-                      this.openFolder(item);
-                    } else {
-                      if (!this.isSelectionMode) {
-                        this.isSelectionMode = true;
-                        this.selectedIndices.add(index);
-                      }
-                    }
-                  }
-                })
-              }
-            }, (item: FileItem) => item.path)
-          }
-          .columnsTemplate('1fr 1fr 1fr 1fr')
-          .columnsGap(4)
-          .rowsGap(4)
-          .padding(4)
-          .width('100%')
-          .layoutWeight(1)
-        }
-      }
-
-      this.StatusBar();
-    }
-    .width('100%')
-    .height('100%')
-    .backgroundColor('#fff')
-  }
-
-  // ---------- 标题栏 Builder ----------
   @Builder
   TitleBar() {
-    Row() {
-      if (this.currentPath !== this.getSandboxRoot()) {
-        Button({ type: ButtonType.Circle }) {
-          Image($r('sys.media.ohos_ic_back'))
-            .width(20)
-            .height(20)
+    Column() {
+      Row() {
+        Text('文件管理器')
+          .fontSize(24)
+          .fontWeight(FontWeight.Bold)
+          .fontColor(ColorResource.text_primary)
+          .layoutWeight(1)
+
+        if (this.isSelectionMode) {
+          Text(`已选择 ${this.selectedIndices.size} 个`)
+            .fontSize(14)
+            .fontColor(ColorResource.text_secondary)
+            .margin({ right: 12 })
         }
-        .onClick((): void => this.goBack())
-        .margin({ right: 8 })
+
+        Button(this.isSelectionMode ? '取消' : '选择')
+          .onClick(() => {
+            if (this.isSelectionMode) {
+              this.selectedIndices.clear();
+              this.isSelectionMode = false;
+            } else {
+              this.isSelectionMode = true;
+            }
+          })
+          .backgroundColor(ColorResource.button_secondary_background)
+          .fontColor(ColorResource.button_secondary_text)
+          .padding({ left: 16, right: 16, top: 8, bottom: 8 })
+          .borderRadius(4)
       }
-      // 显示友好路径名：将沙箱根目录显示为 "应用沙箱"
-      Text(this.currentPath === this.getSandboxRoot() ? '应用沙箱' : this.currentPath.substring(this.getSandboxRoot().length + 1))
-        .fontSize(16)
-        .fontWeight(FontWeight.Medium)
-        .layoutWeight(1)
-        .maxLines(1)
-        .textOverflow({ overflow: TextOverflow.Ellipsis })
-      Button({ type: ButtonType.Circle }) {
-        // 使用系统搜索图标，如果不存在请替换为其他图标
-        Image($r('app.media.search'))
-          .width(20)
-          .height(20)
-      }
-      .onClick((): void => {
-        showToast('搜索功能待实现');   // 使用封装后的函数
-      })
-      .margin({ right: 4 })
-      Button({ type: ButtonType.Circle }) {
-        Image($r('app.media.refresh'))
-          .width(20)
-          .height(20)
-      }
-      .onClick((): void => this.refresh())
+      .width('100%')
+      .padding({ left: 16, right: 16, top: 12, bottom: 12 })
+      .backgroundColor(ColorResource.background_secondary)
     }
-    .padding({ left: 12, right: 12 })
-    .width('100%')
-    .height(56)
-    .backgroundColor('#f5f5f5')
   }
 
-  // ---------- 操作栏 Builder ----------
   @Builder
   ActionBar() {
     Row() {
-      if (this.isSelectionMode) {
-        Button('压缩')
-          .onClick((): void => this.showCompressDialog())
-          .fontSize(14)
-          .height(36)
-        Blank()
-        Button('解压')
-          .onClick((): void => this.showExtractDialog())
-          .fontSize(14)
-          .height(36)
-        Blank()
-        Button('导出')
-          .onClick((): void => {
-            try {
-              this.exportFiles();
-            } catch (err) {
-              console.error('导出失败', JSON.stringify(err));
-              showToast('导出失败');
-            }
-          })
-          .fontSize(14)
-          .height(36)
-        Blank()
-        Button('删除')
-          .onClick((): void => {
-            try {
-              this.showDeleteConfirmDialog();
-            } catch (err) {
-              console.error('删除失败', JSON.stringify(err));
-              showToast('删除失败');
-            }
-          })
-          .fontSize(14)
-          .fontColor(Color.Red)
-          .height(36)
-      } else {
-        Button('新建文件夹')
-          .onClick((): void => {
-            showToast('新建文件夹待实现');
-          })
-          .fontSize(14)
-          .height(36)
-        Blank()
-        Button('导入')
-          .onClick((): void => {
-            try {
-              this.importFiles();
-            } catch (err) {
-              console.error('导入失败', JSON.stringify(err));
-              showToast('导入失败');
-            }
-          })
-          .fontSize(14)
-          .height(36)
-        Blank()
-        Button('导出')
-          .onClick((): void => {
-            try {
-              this.exportFiles();
-            } catch (err) {
-              console.error('导出失败', JSON.stringify(err));
-              showToast('导出失败');
-            }
-          })
-          .fontSize(14)
-          .height(36)
-        Blank()
-        Button('压缩')
-          .onClick((): void => this.showCompressDialog())
-          .fontSize(14)
-          .height(36)
-        Blank()
-        Button('解压')
-          .onClick((): void => this.showExtractDialog())
-          .fontSize(14)
-          .height(36)
-      }
+      // 返回按钮
+      Button('返回')
+        .enabled(this.currentPath !== this.getSandboxRoot())
+        .onClick(() => this.goBack())
+        .backgroundColor(ColorResource.button_secondary_background)
+        .fontColor(ColorResource.button_secondary_text)
+        .padding({ left: 12, right: 12, top: 8, bottom: 8 })
+        .borderRadius(4)
+
+      // 刷新按钮
+      Button('刷新')
+        .onClick(() => this.refresh())
+        .backgroundColor(ColorResource.button_secondary_background)
+        .fontColor(ColorResource.button_secondary_text)
+        .padding({ left: 12, right: 12, top: 8, bottom: 8 })
+        .borderRadius(4)
+        .margin({ left: 8 })
+
+      // 视图切换
+      Button(this.viewMode === 'list' ? '网格' : '列表')
+        .onClick(() => {
+          this.viewMode = this.viewMode === 'list' ? 'grid' : 'list';
+        })
+        .backgroundColor(ColorResource.button_secondary_background)
+        .fontColor(ColorResource.button_secondary_text)
+        .padding({ left: 12, right: 12, top: 8, bottom: 8 })
+        .borderRadius(4)
+        .margin({ left: 8 })
+
+      // 搜索框
+      TextInput({ placeholder: '搜索文件...', text: this.searchKeyword })
+        .onChange((value: string) => this.searchKeyword = value)
+        .layoutWeight(1)
+        .margin({ left: 8 })
+        .padding({ left: 12, right: 12, top: 8, bottom: 8 })
+        .backgroundColor(ColorResource.background_tertiary)
+        .borderRadius(4)
     }
-    .padding({ left: 12, right: 12 })
     .width('100%')
-    .height(48)
-    .backgroundColor('#fafafa')
+    .padding({ left: 16, right: 16, top: 8, bottom: 8 })
+    .backgroundColor(ColorResource.background_primary)
   }
 
-  // ---------- 底部状态栏 Builder ----------
   @Builder
   StatusBar() {
     Row() {
-      Text(`选中 ${this.selectedIndices.size} 项`)
-        .fontSize(12)
-        .fontColor('#666')
-      Blank()
-      Text(`${this.files.length} 个项目`)
-        .fontSize(12)
-        .fontColor('#666')
+      // 全选按钮
+      if (this.isSelectionMode) {
+        Button('全选')
+          .onClick(() => this.toggleSelectAll())
+          .backgroundColor(ColorResource.button_secondary_background)
+          .fontColor(ColorResource.button_secondary_text)
+          .padding({ left: 4, right: 4, top: 8, bottom: 8 })
+          .borderRadius(4)
+          .margin({ right: 8 })
+      }
+
+      // 压缩按钮
+      Button('压缩')
+        .enabled(this.selectedIndices.size > 0)
+        .onClick(() => this.showCompressDialog())
+        .backgroundColor(ColorResource.button_primary_background)
+        .fontColor(ColorResource.button_primary_text)
+        .padding({ left: 12, right: 12, top: 8, bottom: 8 })
+        .borderRadius(4)
+        .margin({ right: 8 })
+
+      // 解压按钮
+      Button('解压')
+        .enabled(this.selectedIndices.size === 1 && isArchiveFile(this.files[Array.from(this.selectedIndices)[0]]?.name || ''))
+        .onClick(() => this.showExtractDialog())
+        .backgroundColor(ColorResource.button_primary_background)
+        .fontColor(ColorResource.button_primary_text)
+        .padding({ left: 12, right: 12, top: 8, bottom: 8 })
+        .borderRadius(4)
+        .margin({ right: 8 })
+
+      // 删除按钮
+      Button('删除')
+        .enabled(this.selectedIndices.size > 0)
+        .onClick(() => this.showDeleteConfirmDialog())
+        .backgroundColor(ColorResource.button_danger_background)
+        .fontColor(ColorResource.button_danger_text)
+        .padding({ left: 12, right: 12, top: 8, bottom: 8 })
+        .borderRadius(4)
+        .margin({ right: 8 })
+
+      // 导入按钮
+      Button('导入')
+        .onClick(() => this.importFiles())
+        .backgroundColor(ColorResource.button_secondary_background)
+        .fontColor(ColorResource.button_secondary_text)
+        .padding({ left: 12, right: 12, top: 8, bottom: 8 })
+        .borderRadius(4)
+        .margin({ right: 8 })
+
+      // 导出按钮
+      Button('导出')
+        .enabled(this.selectedIndices.size > 0)
+        .onClick(() => this.exportFiles())
+        .backgroundColor(ColorResource.button_secondary_background)
+        .fontColor(ColorResource.button_secondary_text)
+        .padding({ left: 12, right: 12, top: 8, bottom: 8 })
+        .borderRadius(4)
     }
-    .padding({ left: 12, right: 12 })
     .width('100%')
-    .height(32)
-    .backgroundColor('#f0f0f0')
-  }
-}
-
-// 压缩对话框组件（需单独文件或在此定义）
-// 定义选项接口，与 Select 组件要求的类型匹配
-interface SelectOption {
-  value: string;
-}
-
-@CustomDialog
-struct CompressDialog {
-  controller?: CustomDialogController;
-  @Prop selectedPaths: string[] = [];  // 数据属性保留 @Prop
-  onConfirm?: (options: CompressOptions) => Promise<void>;  // 移除 @Prop，改为可选
-
-  private formats: ('7z' | 'zip' | 'tar')[] = ['7z', 'zip', 'tar'];
-  @State selectedIndex: number = 0;
-  @State password: string = '';
-  @State splitSize: string = '';
-
-  build() {
-    Column() {
-      Text('压缩选项').fontSize(20).margin(16)
-
-      Row() {
-        Text('格式:').width(80)
-        // 使用泛型 map<SelectOption> 确保返回类型正确
-        Select(this.formats.map<SelectOption>(f => ({ value: f })))
-          .selected(this.selectedIndex)
-          .onSelect((index: number, _: string): void => {
-            this.selectedIndex = index;
-          })
-          .layoutWeight(1)
-      }
-      .width('100%')
-      .padding(8)
-
-      Row() {
-        Text('密码:').width(80)
-        TextInput({ placeholder: '可选', text: this.password })
-          .onChange((value: string) => this.password = value)
-          .type(InputType.Password)
-          .layoutWeight(1)
-      }
-      .width('100%')
-      .padding(8)
-
-      Row() {
-        Text('分卷大小:').width(80)
-        TextInput({ placeholder: '例如 10M', text: this.splitSize })
-          .onChange((value: string) => this.splitSize = value)
-          .layoutWeight(1)
-      }
-      .width('100%')
-      .padding(8)
-
-      Row() {
-        Button('取消')
-          .onClick((): void => { this.controller?.close(); })
-          .margin(8)
-        Button('开始压缩')
-          .onClick(async (): Promise<void> => {
-            this.controller?.close();
-            // 使用可选链调用 onConfirm
-            if (this.onConfirm) {
-              await this.onConfirm({
-                format: this.formats[this.selectedIndex],
-                password: this.password || undefined,
-                splitSize: this.splitSize || undefined
-              });
-            }
-          })
-          .margin(8)
-      }
-      .margin(16)
-    }
-    .padding(16)
-    .width('90%')
-    .backgroundColor('#fff')
-    .borderRadius(16)
-  }
-}
-// 解压对话框组件
-@CustomDialog
-struct ExtractDialog {
-  controller?: CustomDialogController;
-  @Prop archivePath: string = '';
-  @Prop sandboxRoot: string = '';
-  onConfirm?: (destPath: string, password?: string) => Promise<void>;
-
-  @State destPath: string = '';
-  @State password: string = '';
-  @State showDirPicker: boolean = false;
-  @State dirPickerPath: string = '';
-  @State dirPickerItems: FileItem[] = [];
-
-  aboutToAppear(): void {
-    // 根据 archivePath 自动生成默认解压路径
-    console.info('ExtractDialog.aboutToAppear: archivePath =', this.archivePath);
-    
-    if (!this.archivePath) {
-      console.warn('archivePath 为空，使用沙箱根目录');
-      this.destPath = this.sandboxRoot;
-      return;
-    }
-    
-    const lastSlashIndex = this.archivePath.lastIndexOf('/');
-    if (lastSlashIndex === -1) {
-      console.warn('archivePath 不包含路径分隔符:', this.archivePath);
-      this.destPath = this.sandboxRoot + '/' + this.archivePath.replace(/\.[^/.]+$/, '');
-      return;
-    }
-    
-    const baseName = this.archivePath.substring(lastSlashIndex + 1);
-    const dirName = baseName.replace(/\.[^/.]+$/, '') || 'extracted';
-    const parentDir = this.archivePath.substring(0, lastSlashIndex + 1);
-    
-    this.destPath = parentDir + dirName;
-    console.info('生成的解压路径:', this.destPath);
-  }
-
-  /**
-   * 打开目录浏览器，加载沙箱根目录的子目录列表
-   */
-  openDirPicker(): void {
-    this.dirPickerPath = this.sandboxRoot;
-    this.loadDirItems(this.dirPickerPath);
-    this.showDirPicker = true;
-  }
-
-  /**
-   * 加载指定路径下的所有子目录
-   */
-  loadDirItems(path: string): void {
-    try {
-      const names: string[] = fileIo.listFileSync(path);
-      const dirs: FileItem[] = [];
-      for (const name of names) {
-        const fullPath = path + '/' + name;
-        try {
-          const stat = fileIo.statSync(fullPath);
-          if (stat.isDirectory()) {
-            dirs.push({
-              name: name,
-              path: fullPath,
-              isDir: true,
-              size: 0,
-              modified: stat.mtime
-            });
-          }
-        } catch (e) {
-          console.error('stat 失败: ' + fullPath, JSON.stringify(e));
-        }
-      }
-      dirs.sort((a, b) => a.name.localeCompare(b.name));
-      this.dirPickerItems = dirs;
-    } catch (err) {
-      console.error('加载目录列表失败', JSON.stringify(err));
-      this.dirPickerItems = [];
-    }
-  }
-
-  /**
-   * 进入子目录
-   */
-  enterDir(dirPath: string): void {
-    this.dirPickerPath = dirPath;
-    this.loadDirItems(dirPath);
-  }
-
-  /**
-   * 返回上级目录
-   */
-  goUpDir(): void {
-    if (this.dirPickerPath === this.sandboxRoot) {
-      return;
-    }
-    const parent = this.dirPickerPath.substring(0, this.dirPickerPath.lastIndexOf('/'));
-    this.dirPickerPath = parent || this.sandboxRoot;
-    this.loadDirItems(this.dirPickerPath);
-  }
-
-  /**
-   * 确认选择当前目录
-   */
-  confirmDir(): void {
-    this.destPath = this.dirPickerPath;
-    this.showDirPicker = false;
+    .padding({ left: 16, right: 16, top: 8, bottom: 8 })
+    .backgroundColor(ColorResource.background_secondary)
   }
 
   build() {
     Column() {
-      if (this.showDirPicker) {
-        // ---------- 目录浏览器模式 ----------
-        Column() {
-          // 标题栏
-          Row() {
-            if (this.dirPickerPath !== this.sandboxRoot) {
-              Button({ type: ButtonType.Circle }) {
-                Image($r('sys.media.ohos_ic_back'))
-                  .width(18)
-                  .height(18)
-              }
-              .onClick((): void => this.goUpDir())
-              .width(32)
-              .height(32)
-            }
-            Text('选择目标目录')
-              .fontSize(18)
-              .fontWeight(FontWeight.Bold)
-              .layoutWeight(1)
-              .margin({ left: 8 })
-          }
-          .width('100%')
-          .padding(8)
+      // 顶部固定区域（不滚动）
+      this.TitleBar()
+      this.ActionBar()
 
-          // 当前路径
-          Text(this.dirPickerPath === this.sandboxRoot ?
-            '应用沙箱' : this.dirPickerPath.substring(this.sandboxRoot.length + 1))
-            .fontSize(12)
-            .fontColor('#666')
-            .width('100%')
-            .padding({ left: 8, bottom: 4 })
-
-          // 目录列表
-          List({ space: 4 }) {
-            ForEach(this.dirPickerItems, (item: FileItem) => {
-              ListItem() {
-                Row() {
-                  Image($r('app.media.folder'))
-                    .width(24)
-                    .height(24)
-                    .margin({ right: 8 })
-                  Text(item.name)
-                    .fontSize(14)
-                    .layoutWeight(1)
-                  Text('>')
-                    .fontSize(16)
-                    .fontColor('#999')
-                }
-                .padding({ left: 12, right: 12, top: 8, bottom: 8 })
-                .width('100%')
-                .onClick((): void => {
-                  this.enterDir(item.path);
-                })
-              }
-            }, (item: FileItem) => item.path)
-          }
+      // 路径显示栏
+      Row() {
+        Text(this.currentPath)
+          .fontSize(12)
+          .fontColor(ColorResource.text_secondary)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .maxLines(1)
           .layoutWeight(1)
+          .margin({ left: 16, right: 16, top: 8, bottom: 8 })
+      }
+      .backgroundColor(ColorResource.background_tertiary)
+
+      // 可滚动的文件列表区域（自动占满剩余高度）
+      Scroll() {
+        if (this.isLoading) {
+          Column() {
+            LoadingProgress()
+              .color(ColorResource.accent_primary)
+              .width(40)
+              .height(40)
+            Text('加载中...')
+              .fontSize(14)
+              .fontColor(ColorResource.text_secondary)
+              .margin({ top: 12 })
+          }
           .width('100%')
           .height('100%')
-
-          // 按钮行
-          Row() {
-            Button('取消')
-              .onClick((): void => {
-                this.showDirPicker = false;
-              })
-              .margin(8)
-            Button('选择此目录')
-              .onClick((): void => {
-                this.confirmDir();
-              })
-              .margin(8)
-              .fontColor(Color.White)
-              .backgroundColor('#007aff')
+          .justifyContent(FlexAlign.Center)
+          .alignItems(HorizontalAlign.Center)
+        } else if (this.files.length === 0) {
+          Column() {
+            Image($r('app.media.folder'))
+              .width(80)
+              .height(80)
+              .margin({ bottom: 16 })
+            Text('文件夹为空')
+              .fontSize(16)
+              .fontColor(ColorResource.text_secondary)
           }
           .width('100%')
+          .height('100%')
           .justifyContent(FlexAlign.Center)
-          .padding(8)
-        }
-        .width('100%')
-        .height('100%')
-      } else {
-        // ---------- 正常解压表单模式 ----------
-        Text('解压到')
-          .fontSize(20)
-          .fontWeight(FontWeight.Bold)
-          .margin(16)
-
-        // 目标路径行
-        Row() {
-          Text('目标路径:')
-            .width(80)
-          TextInput({ placeholder: '选择路径', text: this.destPath })
-            .onChange((value: string) => this.destPath = value)
-            .layoutWeight(1)
-          Button('...')
-            .onClick((): void => {
-              this.openDirPicker();
-            })
-            .height(40)
-        }
-        .width('100%')
-        .padding(8)
-
-        // 密码输入行
-        Row() {
-          Text('密码:')
-            .width(80)
-          TextInput({ placeholder: '如果需要', text: this.password })
-            .onChange((value: string) => this.password = value)
-            .type(InputType.Password)
-            .layoutWeight(1)
-        }
-        .width('100%')
-        .padding(8)
-
-        // 按钮行
-        Row() {
-          Button('取消')
-            .onClick((): void => {
-              this.controller?.close();
-            })
-            .margin(8)
-          Button('开始解压')
-            .onClick(async (): Promise<void> => {
-              // 验证目标路径
-              if (!this.destPath || this.destPath.trim() === '') {
-                showToast('请选择或输入有效的目标路径');
-                return;
-              }
-              
-              // 清理路径：移除开头和结尾的空格，确保以沙箱根目录开头
-              let cleanPath = this.destPath.trim();
-              if (!cleanPath.startsWith(this.sandboxRoot)) {
-                // 如果不是绝对路径，则相对于沙箱根目录
-                if (cleanPath.startsWith('/')) {
-                  // 已经是绝对路径，但不在沙箱内
-                  showToast('目标路径必须在应用沙箱内');
-                  return;
-                } else {
-                  // 相对路径，转换为绝对路径
-                  cleanPath = this.sandboxRoot + '/' + cleanPath;
+          .alignItems(HorizontalAlign.Center)
+        } else {
+          if (this.viewMode === 'list') {
+            List() {
+              ForEach(this.files, (item: FileItem, index: number) => {
+                ListItem() {
+                  FileRow({
+                    item: item,
+                    selected: this.selectedIndices.has(index),
+                    isSelectionMode: this.isSelectionMode,
+                    onSelect: (selected: boolean) => this.toggleSelect(index, selected),
+                    onOpen: () => {
+                      if (item.isDir) {
+                        this.openFolder(item);
+                      } else if (isArchiveFile(item.name)) {
+                        this.openArchiveItem(item);
+                      } else {
+                        this.openFileWithOtherApp(item);
+                      }
+                    }
+                  })
                 }
-              }
-              
-              this.controller?.close();
-              if (this.onConfirm) {
-                await this.onConfirm(cleanPath, this.password || undefined);
-              }
-            })
-            .margin(8)
-        }
-        .margin(16)
-      }
-    }
-    .padding(16)
-    .width('90%')
-    .height(this.showDirPicker ? '80%' : 'auto')
-    .backgroundColor('#fff')
-    .borderRadius(16)
-  }
-}
-
-// 删除确认对话框组件
-@CustomDialog
-struct DeleteConfirmDialog {
-  controller?: CustomDialogController;
-  @Prop message: string = '';
-  onConfirm?: () => Promise<void>;
-
-  build() {
-    Column() {
-      Text('确认删除')
-        .fontSize(20)
-        .fontWeight(FontWeight.Bold)
-        .margin({ top: 16, bottom: 16 })
-
-      Text(this.message)
-        .fontSize(14)
-        .textAlign(TextAlign.Start)
-        .padding({ left: 16, right: 16, bottom: 24 })
-        .width('100%')
-
-      Row() {
-        Button('取消')
-          .onClick((): void => {
-            this.controller?.close();
-          })
-          .backgroundColor('#f0f0f0')
-          .fontColor(Color.Black)
-          .margin(8)
-          .width(100)
-          .height(40)
-
-        Button('确认删除')
-          .onClick(async (): Promise<void> => {
-            this.controller?.close();
-            if (this.onConfirm) {
-              await this.onConfirm();
+              }, (item: FileItem) => item.path)
             }
-          })
-          .backgroundColor('#ff4d4f')
-          .fontColor(Color.White)
-          .margin(8)
-          .width(100)
-          .height(40)
+            .width('100%')
+            .height('100%')   // 添加这行
+          } else {
+            Grid() {
+              ForEach(this.files, (item: FileItem, index: number) => {
+                GridItem() {
+                  FileGridCell({
+                    item: item,
+                    selected: this.selectedIndices.has(index),
+                    isSelectionMode: this.isSelectionMode,
+                    onSelect: (selected: boolean) => this.toggleSelect(index, selected),
+                    onOpen: () => {
+                      if (item.isDir) {
+                        this.openFolder(item);
+                      } else if (isArchiveFile(item.name)) {
+                        this.openArchiveItem(item);
+                      } else {
+                        this.openFileWithOtherApp(item);
+                      }
+                    }
+                  })
+                }
+              }, (item: FileItem) => item.path)
+            }
+            .columnsTemplate('1fr 1fr 1fr')
+            .rowsTemplate('auto')
+            .columnsGap(8)
+            .rowsGap(8)
+            .width('100%')
+            .padding(8)
+          }
+        }
       }
-      .justifyContent(FlexAlign.Center)
       .width('100%')
-      .margin({ bottom: 16 })
+      .layoutWeight(1)              // 关键：占据剩余所有垂直空间
+      .scrollable(ScrollDirection.Vertical)
+      .scrollBar(BarState.Auto)
+      .edgeEffect(EdgeEffect.Spring)
+
+      // 底部功能区（始终在底部）
+      this.StatusBar()
     }
-    .padding(16)
-    .width('80%')
-    .backgroundColor('#fff')
-    .borderRadius(16)
+    .width('100%')
+    .height('100%')
+    .backgroundColor(ColorResource.background_primary)
   }
 }
