@@ -184,10 +184,17 @@ export struct ExtractDialog {
 
       // 外部存储提示
       if (this.isExternal) {
-        Text('提示：文件将先解压到临时目录，然后复制到外部存储，完成后自动删除临时文件')
-          .fontSize(12)
-          .fontColor(ColorResource.status_info)
-          .margin({ top: 8, bottom: 8 })
+        Column() {
+          Text('提示：文件将先解压到临时目录，然后复制到外部存储，完成后自动删除临时文件')
+            .fontSize(12)
+            .fontColor(ColorResource.status_info)
+            .margin({ top: 8, bottom: 4 })
+          Text('注意：外部存储将扁平化保存所有文件（不保留文件夹层级）')
+            .fontSize(12)
+            .fontColor(ColorResource.status_warning)
+            .margin({ bottom: 8 })
+        }
+        .width('100%')
       }
 
       // 操作按钮
@@ -265,7 +272,7 @@ interface SelectOption {
 @CustomDialog
 export struct DirectoryPickerDialog {
   controller: CustomDialogController;
-  sandboxRoot: string = '';                    // 必传属性
+  sandboxRoot: string = '';
   onSelect?: (uri: string, isExternal: boolean) => void;
 
   private context: common.UIAbilityContext | null = null;
@@ -278,12 +285,13 @@ export struct DirectoryPickerDialog {
       console.error('DirectoryPickerDialog 获取上下文失败', e);
     }
 
-    // 初始化内部目录选择器
+    // 内部目录选择器（始终可用）
     this.internalPickerController = new CustomDialogController({
       builder: InternalDirectoryPickerDialog({
         sandboxRoot: this.sandboxRoot,
         onSelect: (selectedPath: string) => {
           this.onSelect?.(selectedPath, false);
+          this.controller.close(); // 选择完毕后关闭外层对话框
         }
       }),
       autoCancel: true,
@@ -298,6 +306,7 @@ export struct DirectoryPickerDialog {
         .fontWeight(FontWeight.Bold)
         .margin({ top: 16, bottom: 16 })
 
+      // 按钮1：内部存储（沙箱）- 始终可用
       Button('内部存储（沙箱）')
         .width('80%')
         .margin({ bottom: 12 })
@@ -305,6 +314,7 @@ export struct DirectoryPickerDialog {
           this.internalPickerController?.open();
         })
 
+      // 按钮2：外部存储（公共目录）- 根据能力决定行为
       Button('外部存储（公共目录）')
         .width('80%')
         .margin({ bottom: 20 })
@@ -313,28 +323,45 @@ export struct DirectoryPickerDialog {
             promptAction.showToast({ message: '无法获取应用上下文' });
             return;
           }
-          if (!canIUse('picker.DocumentSelectOptions.selectMode')) {
-            promptAction.showToast({ message: '当前系统版本不支持选择目录，请手动输入路径' });
-            this.onSelect?.('', false);
-            this.controller.close();
+
+          // 第一步：检测是否支持文件夹选择器
+          const supportsFolderPicker = canIUse('SystemCapability.FileManagement.UserFileService.FolderSelection');
+
+          if (!supportsFolderPicker) {
+            // 不支持 -> 友好提示，并引导使用内部存储
+            promptAction.showToast({
+              message: '当前设备不支持直接选择外部文件夹，您可以使用“内部存储”功能',
+              duration: 2000
+            });
+            // 可选：自动打开内部选择器
+            this.internalPickerController?.open();
             return;
           }
+
+          // 第二步：支持 -> 尝试调用系统 DocumentViewPicker
           try {
             const options = new picker.DocumentSelectOptions();
             options.selectMode = picker.DocumentSelectMode.FOLDER;
             const documentPicker = new picker.DocumentViewPicker(this.context);
             const uris = await documentPicker.select(options);
             if (uris && uris.length > 0) {
+              // 成功获取到外部目录 URI
               this.onSelect?.(uris[0], true);
+              this.controller.close();
             } else {
-              this.onSelect?.('', false);
+              // 用户取消选择
+              promptAction.showToast({ message: '未选择目录' });
             }
           } catch (err) {
             console.error('选择外部目录失败', err);
-            promptAction.showToast({ message: '选择目录失败: ' + (err as Error).message });
-            this.onSelect?.('', false);
+            // 选择器可能被系统限制或取消
+            promptAction.showToast({
+              message: '选择目录失败，请尝试使用“内部存储”选项',
+              duration: 2000
+            });
+            // 降级：打开内部选择器
+            this.internalPickerController?.open();
           }
-          this.controller.close();
         })
     }
     .width('80%')

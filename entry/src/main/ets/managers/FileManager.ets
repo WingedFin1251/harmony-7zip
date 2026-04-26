@@ -26,6 +26,10 @@ export class FileManager {
     this.context = context;
   }
 
+  hasContext(): boolean {
+    return this.context !== null;
+  }
+
   async loadFiles(): Promise<void> {
     try {
       if (!this.currentPath || this.currentPath.trim() === '') {

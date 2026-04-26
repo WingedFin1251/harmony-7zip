@@ -1,37 +1,163 @@
-import * as native from 'libentry.so';
 import { fileIo } from '@kit.CoreFileKit';
+import worker from '@ohos.worker';
 import { ToastUtil } from '../utils/ToastUtil';
 import { CompressOptions, ExtractOptions, ValidationResult, SupportedFormat } from '../types/types';
 
+// 顶层接口声明
+interface WorkerResponse {
+  success: boolean;
+  error?: string;
+  taskId: number;
+}
+
+interface TaskCallback {
+  resolve: (value: void) => void;
+  reject: (reason: Error) => void;
+}
+
+interface WorkerMessage {
+  type: string;
+  params: object;
+  taskId: number;
+}
+
+interface WorkerCompressOptions {
+  format: string;
+  password?: string;
+  splitSize?: string;
+}
+
+interface CompressWorkerParams {
+  files: string[];
+  archivePath: string;
+  options: WorkerCompressOptions;
+}
+
+interface ExtractWorkerParams {
+  archivePath: string;
+  destPath: string;
+  password: string;
+}
+
+interface CopyWorkerParams {
+  srcDir: string;
+  destDirUri: string;
+}
+
+interface DeleteWorkerParams {
+  path: string;
+}
+
+interface WorkerMessageEvent {
+  data: WorkerResponse;
+}
+
 export class ArchiveManager {
+  private worker: worker.ThreadWorker | null = null;
+  private taskCounter = 0;
+  private pendingTasks = new Map<number, TaskCallback>();
+
+  constructor() {
+    this.worker = new worker.ThreadWorker('entry/ets/workers/archive.worker.ets');
+    this.worker.onmessage = (event: WorkerMessageEvent): void => {
+      const data = event.data;
+      const task = this.pendingTasks.get(data.taskId);
+      if (task) {
+        if (data.success) {
+          task.resolve();
+        } else {
+          task.reject(new Error(data.error || 'Unknown error'));
+        }
+        this.pendingTasks.delete(data.taskId);
+      }
+    };
+    // 使用 Object 类型，兼容鸿蒙的 MessageEvents 等未知类型
+    this.worker.onerror = (err: Object): void => {
+      console.error('Worker error:', err);
+    };
+    this.worker.onmessageerror = (err: Object): void => {
+      console.error('Worker message error:', err);
+    };
+  }
+
+  // 清理Worker资源
+  terminate(): void {
+    if (this.worker) {
+      try {
+        this.worker.terminate();
+      } catch (err) {
+        console.error('Worker terminate error:', err);
+      } finally {
+        this.worker = null;
+        this.pendingTasks.clear();
+      }
+    }
+  }
+
+  private postTask(type: string, params: object): Promise<void> {
+    return new Promise((resolve, reject) => {
+      if (!this.worker) {
+        reject(new Error('Worker not initialized'));
+        return;
+      }
+      const taskId = this.taskCounter++;
+      const callback: TaskCallback = { resolve, reject };
+      this.pendingTasks.set(taskId, callback);
+      const message: WorkerMessage = { type, params, taskId };
+      try {
+        this.worker.postMessage(message);
+      } catch (err) {
+        // 发生异常时清理 pending 任务并 reject
+        this.pendingTasks.delete(taskId);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
+    });
+  }
+  // 检查是否为外部存储URI
+  private isExternalUri(path: string): boolean {
+    return path.startsWith('file://docs/') || path.startsWith('file://media/');
+  }
+
+  // 从外部URI提取目录路径
+  private getExternalDirFromUri(uri: string): string {
+    // file://docs/storage/Users/currentUser/Download -> /storage/Users/currentUser/Download
+    return uri.replace('file://docs/', '').replace('file://media/', '');
+  }
+
   // 开始压缩
   async startCompress(selectedPaths: string[], currentPath: string, options: CompressOptions): Promise<void> {
     try {
-      // 检查原生模块是否可用
-      if (!native || typeof native.compress !== 'function') {
-        throw new Error('压缩模块未加载或不可用');
-      }
-
       // 检查参数
       if (!selectedPaths || selectedPaths.length === 0) {
         throw new Error('请选择要压缩的文件');
       }
 
-      // 生成压缩文件路径
       const archiveName = 'archive_' + Date.now() + '.' + options.format;
       const archivePath = currentPath + '/' + archiveName;
-
       console.log('开始压缩:', selectedPaths, '->', archivePath);
       
-      await native.compress(
-        selectedPaths,
-        archivePath,
-        options
-      );
+      // 提交到 Worker
+      const compressOptions: WorkerCompressOptions = {
+        format: options.format,
+        password: options.password,
+        splitSize: options.splitSize
+      };
+      const compressParams: CompressWorkerParams = {
+        files: selectedPaths,
+        archivePath: archivePath,
+        options: compressOptions
+      };
+      await this.postTask('compress', compressParams);
+      
       ToastUtil.showToast('压缩完成: ' + archiveName);
     } catch (err) {
-      const errMsg = (err as Error).message;
-      console.error('压缩失败详情:', JSON.stringify(err));
+      console.error('压缩失败 catch 块:', JSON.stringify(err), err);
+      console.error('压缩失败类型:', typeof err);
+      if (err && typeof err === 'object') {
+        console.error('压缩失败对象键:', Object.keys(err));
+      }
+      const errMsg = err instanceof Error ? err.message : String(err);
+      console.error('压缩失败信息:', errMsg);
       
       if (errMsg.includes('password')) {
         ToastUtil.showToast('密码错误或加密失败');
@@ -48,60 +174,73 @@ export class ArchiveManager {
     }
   }
 
-  // 开始解压
+  // 开始解压（修改后）
   async startExtract(selectedPaths: string[], currentPath: string, options: ExtractOptions): Promise<void> {
     try {
-      // 检查原生模块是否可用
-      if (!native || typeof native.extract !== 'function') {
-        throw new Error('解压模块未加载或不可用');
-      }
-
-      // 检查参数
       if (!selectedPaths || selectedPaths.length === 0) {
         throw new Error('请选择要解压的文件');
       }
 
       const archivePath = selectedPaths[0];
-      
-      // 检查文件是否存在
+      // 检查文件存在（轻量操作，可保留在主线程）
       try {
-        const stat = fileIo.statSync(archivePath);
-        if (!stat) {
-          throw new Error('压缩文件不存在');
-        }
-      } catch (statErr) {
-        throw new Error('无法访问压缩文件: ' + (statErr as Error).message);
+        fileIo.statSync(archivePath);
+      } catch {
+        throw new Error('压缩文件不存在或无法访问');
       }
 
-      // 生成解压目录
       const timestamp = Date.now();
       const extractPath = options.extractPath || currentPath + '/extracted_' + timestamp;
+      const isExternal = this.isExternalUri(extractPath);
+      let actualExtractPath: string;
+      let externalUri: string = '';
 
-      console.log('开始解压:', archivePath, '->', extractPath);
-      
-      await native.extract(
-        archivePath,
-        extractPath,
-        options.password || ''
-      );
-      ToastUtil.showToast('解压完成到: ' + extractPath);
-    } catch (err) {
-      const errMsg = (err as Error).message;
-      console.error('解压失败详情:', JSON.stringify(err));
-      
-      if (errMsg.includes('password')) {
-        ToastUtil.showToast('密码错误');
-      } else if (errMsg.includes('format')) {
-        ToastUtil.showToast('不支持的压缩格式或文件损坏');
-      } else if (errMsg.includes('size')) {
-        ToastUtil.showToast('磁盘空间不足');
-      } else if (errMsg.includes('未加载') || errMsg.includes('不可用')) {
-        ToastUtil.showToast('解压功能暂时不可用');
-      } else if (errMsg.includes('不存在') || errMsg.includes('无法访问')) {
-        ToastUtil.showToast('压缩文件不存在或无法访问');
+      if (isExternal) {
+        externalUri = extractPath;
+        actualExtractPath = currentPath + '/temp_extract_' + timestamp;
+        fileIo.mkdirSync(actualExtractPath, true);
+
+        // 解压到临时目录（Worker）
+        const extractParams: ExtractWorkerParams = {
+          archivePath: archivePath,
+          destPath: actualExtractPath,
+          password: options.password || ''
+        };
+        await this.postTask('extract', extractParams);
+
+        // 复制到外部目录（Worker）
+        const copyParams: CopyWorkerParams = {
+          srcDir: actualExtractPath,
+          destDirUri: externalUri
+        };
+        await this.postTask('copyToExternal', copyParams);
+
+        // 删除临时目录（Worker）
+        const deleteParams: DeleteWorkerParams = {
+          path: actualExtractPath
+        };
+        await this.postTask('delete', deleteParams);
+        ToastUtil.showToast('解压完成（已扁平化复制到外部目录）');
       } else {
-        ToastUtil.showToast('解压失败: ' + errMsg);
+        actualExtractPath = extractPath;
+        fileIo.mkdirSync(actualExtractPath, true);
+        const extractParams2: ExtractWorkerParams = {
+          archivePath: archivePath,
+          destPath: actualExtractPath,
+          password: options.password || ''
+        };
+        await this.postTask('extract', extractParams2);
+        ToastUtil.showToast('解压完成到: ' + extractPath);
       }
+    } catch (err) {
+      console.error('解压失败 catch 块:', JSON.stringify(err), err);
+      console.error('解压失败类型:', typeof err);
+      if (err && typeof err === 'object') {
+        console.error('解压失败对象键:', Object.keys(err));
+      }
+      const errMsg = err instanceof Error ? err.message : String(err);
+      console.error('解压失败信息:', errMsg);
+      ToastUtil.showToast('解压失败: ' + errMsg);
       throw new Error(errMsg);
     }
   }

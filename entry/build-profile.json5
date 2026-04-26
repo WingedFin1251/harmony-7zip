@@ -1,6 +1,11 @@
 {
   "apiType": "stageMode",
   "buildOption": {
+    "sourceOption": {
+      "workers": ["./src/main/ets/workers/archive.worker.ts"]
+    },
+    "arkOptions": {
+    },
     "resOptions": {
       "copyCodeResource": {
         "enable": false
@@ -10,6 +15,7 @@
       "path": "./src/main/cpp/CMakeLists.txt",
       "arguments": "",
       "cppFlags": "",
+      "abiFilters": ["arm64-v8a", "x86_64"]
     }
   },
   "buildOptionSet": [

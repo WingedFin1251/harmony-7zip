@@ -38,6 +38,14 @@ struct FileBrowser {
 
   aboutToAppear(): void {
     try {
+      // 先尝试获取 UIContext 并设置
+      const uiContext = this.getUIContext();
+      if (uiContext) {
+        ToastUtil.setUIContext(uiContext);
+      } else {
+        console.warn('无法获取 UIContext，Toast 功能可能受限');
+      }
+
       // 获取 UIAbilityContext
       const context = getContext(this) as common.UIAbilityContext;
       if (context && context.filesDir) {
@@ -46,9 +54,6 @@ struct FileBrowser {
 
         this.fileManager = new FileManager(this.currentPath, context);
         this.archiveManager = new ArchiveManager();
-
-        const uiContext = this.getUIContext();
-        ToastUtil.setUIContext(uiContext);
 
         this.loadFiles();
       } else {
@@ -102,6 +107,28 @@ struct FileBrowser {
       throw new Error('FileManager 未初始化');
     }
     return this.fileManager;
+  }
+
+  // 确保FileManager有context，如果没有则尝试获取
+  private ensureFileManagerHasContext(): boolean {
+    const fileManager = this.getFileManager();
+    if (fileManager.hasContext()) {
+      return true;
+    }
+    
+    try {
+      // 尝试获取UIAbilityContext
+      const context = getContext(this) as common.UIAbilityContext;
+      if (context) {
+        fileManager.setContext(context);
+        console.log('FileManager context 已设置');
+        return true;
+      }
+    } catch (err) {
+      console.error('获取UIAbilityContext失败:', err);
+    }
+    
+    return false;
   }
 
   // 辅助方法：安全访问 archiveManager
@@ -303,17 +330,32 @@ struct FileBrowser {
   }
 
   async importFiles(): Promise<void> {
+    if (!this.ensureFileManagerHasContext()) {
+      ToastUtil.showToast('导入失败: 应用上下文未初始化');
+      return;
+    }
+    
     const fileManager = this.getFileManager();
     await fileManager.importFiles();
     this.files = fileManager.getFiles();
   }
 
   async exportFiles(): Promise<void> {
+    if (!this.ensureFileManagerHasContext()) {
+      ToastUtil.showToast('导出失败: 应用上下文未初始化');
+      return;
+    }
+    
     const fileManager = this.getFileManager();
     await fileManager.exportFiles();
   }
 
   async openFileWithOtherApp(item: FileItem): Promise<void> {
+    if (!this.ensureFileManagerHasContext()) {
+      ToastUtil.showToast('打开文件失败: 应用上下文未初始化');
+      return;
+    }
+    
     try {
       await this.getFileManager().openWithOtherApp(item.path);
     } catch (err) {
