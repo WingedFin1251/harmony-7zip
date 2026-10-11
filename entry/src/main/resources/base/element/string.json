@@ -1,0 +1,28 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "module description"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "description"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "label"
+    },
+    {
+      "name": "read_storage_permission_reason",
+      "value": "用于读取文件以进行导出操作"
+    },
+    {
+      "name": "write_storage_permission_reason",
+      "value": "用于将文件导出到用户存储"
+    },
+    {
+      "name": "file_access_permission_reason",
+      "value": "用于访问文件管理器导入文件"
+    }
+  ]
+}

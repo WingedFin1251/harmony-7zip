@@ -1,0 +1,118 @@
+#!/bin/sh
+# ============================================================================
+# 提交前隐私守卫（本仓库）
+#
+# 背景：本仓库历史上曾把 DevEco 自动签名配置（含本机绝对路径与加密后的签名口令）
+# 提交进公开历史，另外两份 IDE 助手会话 md 也带着大量本机绝对路径进过历史。
+# 此脚本用于**根治复发路径**：只要钩子生效，这类内容就进不了新的提交。
+#
+# 安装（每份克隆执行一次）：
+#   git config core.hooksPath .githooks
+# 手工扫描某区间：
+#   PRIVACY_RANGE=<from>..<to> sh .githooks/pre-commit
+# 确认无风险时跳过：
+#   ALLOW_PRIVACY=1 git commit ...
+#
+# 输出只给「文件:行号」，**刻意不打印命中内容** —— 否则日志本身就成了二次泄露。
+# ============================================================================
+set -u
+
+if [ "${ALLOW_PRIVACY:-}" = "1" ]; then
+  echo "[privacy] ALLOW_PRIVACY=1，跳过隐私检查" >&2
+  exit 0
+fi
+
+# fail-closed：缺少必需命令时**拒绝提交**，绝不能因为工具缺失而"静默通过"
+# （本次实测踩过：PATH 里没有 coreutils 时，守卫会报「通过」＝失效）
+for tool in git grep cut sort head sed; do
+  command -v "$tool" >/dev/null 2>&1 || {
+    echo "[privacy] 缺少必需命令 '$tool'，无法完成隐私检查 —— 按 fail-closed 拒绝本次操作。" >&2
+    echo "[privacy] 如确认要跳过：ALLOW_PRIVACY=1 git commit ..." >&2
+    exit 1
+  }
+done
+
+# 守卫自身的实现文件必然包含这些模式，豁免之
+EXCLUDE=':(exclude).githooks/** :(exclude).github/workflows/**'
+
+if [ -n "${PRIVACY_RANGE:-}" ]; then
+  MODE="区间 $PRIVACY_RANGE"
+  REVS=$(git rev-list "$PRIVACY_RANGE" 2>/dev/null) || REVS=""
+  if [ -z "$REVS" ]; then
+    echo "[privacy] 区间 '$PRIVACY_RANGE' 无法解析，退化为只扫描 HEAD" >&2
+    REVS=$(git rev-parse HEAD)
+  fi
+  GREP_TARGET="$REVS"
+  FILES=$(git diff --name-only --diff-filter=ACM "$PRIVACY_RANGE" 2>/dev/null)
+else
+  if [ -n "${PRIVACY_REV:-}" ]; then
+    MODE="提交 $PRIVACY_REV"
+    GREP_TARGET="$PRIVACY_REV"
+    FILES=$(git ls-tree -r --name-only "$PRIVACY_REV" 2>/dev/null)
+  else
+    MODE="暂存区"
+    GREP_TARGET="--cached"
+    FILES=$(git diff --cached --name-only --diff-filter=ACM)
+  fi
+fi
+
+if [ -z "$FILES" ]; then
+  echo "[privacy] $MODE 无新增/修改文件，跳过"
+  exit 0
+fi
+
+fail=0
+note() { printf '  X %s\n' "$1"; fail=1; }
+
+# ---------------------------------------------------------------- 1) 文件类型
+bad=$(printf '%s\n' "$FILES" | grep -Ei '\.(p12|p7b|cer|csr|jks|keystore|hap|apk|zip|db|sqlite|sqlite3)$|signing-config|(^|/)\.ohos/' || true)
+if [ -n "$bad" ]; then
+  echo "[privacy] 以下文件不应入库："
+  printf '%s\n' "$bad" | sed 's/^/    /'
+  note "敏感文件类型"
+fi
+
+# ---------------------------------------------------------------- 2) 内容规则
+# 一律使用 POSIX ERE（git grep -E）：不支持 \s，也不支持负向断言，
+# 因此"非掩码口令"用 [^*] 表达（掩码以 * 开头，视为安全）。
+# 内置的 p7zip 上游源码树里本来就有上游作者的个人路径与邮箱（实测会产生假阳性，
+# 把真正的风险淹没）。因此**噪音大的规则**对上游树豁免；高信号规则（签名口令、
+# DevEco 加密串、Windows 用户目录、.ohos）仍然全仓库生效。
+VENDOR='entry/src/main/cpp/p7zip-17.05/**'
+
+check() {
+  rule="$1"; pat="$2"; extra="${3:-}"
+  hits=$(git grep --no-color -n -E "$pat" $GREP_TARGET -- . $EXCLUDE $extra 2>/dev/null \
+         | cut -d: -f1,2 | sort -u | head -20)
+  if [ -n "$hits" ]; then
+    echo "[privacy] 命中「$rule」："
+    printf '%s\n' "$hits" | sed 's/^/    /'
+    note "$rule"
+  fi
+}
+
+check "签名明文口令"        '"(store|key)Password"[[:space:]]*:[[:space:]]*"[^*]'
+check "DevEco 加密口令串"   '0000001[0-9A-F]{20,}'
+check "本机用户目录路径"    '[A-Za-z]:[\\/]{1,2}Users[\\/]'
+check "本机用户目录路径(msys)" '(^|[^A-Za-z0-9])/Users/[A-Za-z0-9._-]+/' ":(exclude)$VENDOR"
+check ".ohos 配置目录"      '[\\/]\.ohos[\\/]'
+check "序列号字段"          '(sn|serial|序列号)[[:space:]]*[:=][[:space:]]*"?[0-9A-Z]{12,}'
+check "MAC地址"             '([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}'
+
+mails=$(git grep --no-color -h -o -E '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' $GREP_TARGET -- . $EXCLUDE ":(exclude)$VENDOR" 2>/dev/null \
+        | sort -u | grep -vi 'noreply\.github\.com' || true)
+if [ -n "$mails" ]; then
+  echo "[privacy] 命中「非 noreply 邮箱」："
+  printf '%s\n' "$mails" | sed 's/^/    /'
+  note "非 noreply 邮箱"
+fi
+
+# ---------------------------------------------------------------- 3) 结论
+if [ "$fail" = "1" ]; then
+  echo "" >&2
+  echo "[privacy] 检查未通过（$MODE）。请删除上述内容后重试；" >&2
+  echo "[privacy] 若确认无隐私风险，可用 ALLOW_PRIVACY=1 git commit ... 跳过。" >&2
+  exit 1
+fi
+echo "[privacy] 通过（$MODE）"
+exit 0
